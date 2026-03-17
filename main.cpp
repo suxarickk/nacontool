@@ -27,7 +27,38 @@ enum CC : WORD {
 };
 
 static HANDLE hCon;
+static FILE*  gLog = nullptr;   // лог-файл
 
+// ─── Лог: открывается при старте, пишется при каждом изменении ────
+void logOpen() {
+    fopen_s(&gLog, "sniffer.log", "w");
+    if (gLog) {
+        fprintf(gLog, "=== Nacon MG-X sniffer log ===\n");
+        fprintf(gLog, "Format: PKT#  B<byte_index>:<old_hex>-><new_hex>\n");
+        fprintf(gLog, "Press S in console to toggle sniffer ON/OFF\n\n");
+        fflush(gLog);
+    }
+}
+void logClose() { if (gLog) { fclose(gLog); gLog = nullptr; } }
+
+// Пишет строку дельты в файл
+void logDelta(DWORD pkt, const char* line) {
+    if (!gLog) return;
+    fprintf(gLog, "PKT%-6lu  %s\n", pkt, line);
+    fflush(gLog);
+}
+
+// Пишет полный hex-дамп первого пакета для анализа
+void logFullPacket(DWORD pkt, const BYTE* buf, DWORD sz) {
+    if (!gLog) return;
+    fprintf(gLog, "PKT%-6lu  RAW[%lu]: ", pkt, sz);
+    for (DWORD i = 0; i < sz && i < 64; i++)
+        fprintf(gLog, "%02X ", buf[i]);
+    fprintf(gLog, "\n");
+    fflush(gLog);
+}
+
+// ─── Console helpers ──────────────────────────────────────────────
 inline void cWrite(const char* s) {
     DWORD n = (DWORD)strlen(s);
     WriteConsoleA(hCon, s, n, &n, NULL);
@@ -62,10 +93,13 @@ void uiFrame() {
     cPr(0,7,SEP,CC_DGRY);
     cPr(0,8,"  FACE:",CC_DGRY); cPr(42,8,"THUMBS:",CC_DGRY);
     cPr(0,9,SEP,CC_DGRY);
-    cPr(0,10,"  RAW HID:",CC_DGRY); cPr(0,14,SEP,CC_DGRY); cPr(0,15,"  SNIFER",CC_DGRY);
+    cPr(0,10,"  RAW HID:",CC_DGRY); cPr(0,14,SEP,CC_DGRY);
+    cPr(0,15,"  SNIFER",CC_DGRY);
     cPr(0,21,SEP,CC_DGRY);
     cPr(1,22,"[S]",CC_YEL); cPr(4,22," snifer on/off",CC_DGRY);
     cPr(20,22,"[ESC]",CC_YEL); cPr(25,22," exit",CC_DGRY);
+    // Подсказка про лог файл
+    cPr(38,22,"log->",CC_DGRY); cPr(43,22,"sniffer.log",CC_YEL);
 }
 
 void uiBtn(int x,int y,const char* l,bool on) {
@@ -148,7 +182,9 @@ void uiRestore() {
     SetConsoleTextAttribute(hCon,CC_GRY); cXY(0,23); cWrite("\n");
 }
 
-void SnifferDelta(const std::vector<BYTE>& cur, std::vector<BYTE>& prev, DWORD /*sz*/) {
+// ─── Дельта-снифер — пишет и в консоль и в файл ──────────────────
+void SnifferDelta(const std::vector<BYTE>& cur, std::vector<BYTE>& prev,
+                  DWORD /*sz*/, DWORD pktNum) {
     DWORD m=(DWORD)min(cur.size(),prev.size());
     char line[UI_W+2]={}; int pos=0;
     for(DWORD i=0;i<m&&pos<UI_W-12;i++) {
@@ -157,7 +193,10 @@ void SnifferDelta(const std::vector<BYTE>& cur, std::vector<BYTE>& prev, DWORD /
             if(n>0) pos+=n;
         }
     }
-    if(pos>0) uiSnifferAdd(line);
+    if(pos>0) {
+        uiSnifferAdd(line);
+        logDelta(pktNum, line);   // пишем в файл
+    }
     prev=cur;
 }
 
@@ -171,18 +210,13 @@ struct HG {
     bool valid()const{return h!=INVALID_HANDLE_VALUE;}
 };
 
-// ─────────────────────────────────────────────────────────────────
-//  OpenNacon: перебираем ВСЕ интерфейсы с нужным VID/PID,
-//  выбираем тот у которого МАКСИМАЛЬНЫЙ InputReportByteLength —
-//  это основной геймпадный интерфейс у MFi-устройств.
-// ─────────────────────────────────────────────────────────────────
+// ─── OpenNacon: выбираем интерфейс с максимальным пакетом ─────────
 HANDLE OpenNacon() {
     GUID hidGuid; HidD_GetHidGuid(&hidGuid);
     HDEVINFO hdi=SetupDiGetClassDevs(&hidGuid,NULL,NULL,DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
     if(hdi==INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 
     SP_DEVICE_INTERFACE_DATA did={}; did.cbSize=sizeof(did);
-
     char  bestPath[512]={};
     DWORD bestSize=0;
 
@@ -202,8 +236,7 @@ HANDLE OpenNacon() {
 
         HIDD_ATTRIBUTES attr={sizeof(attr)};
         bool match=HidD_GetAttributes(ht,&attr)
-            &&attr.VendorID==NACON_VID
-            &&attr.ProductID==NACON_PID;
+            &&attr.VendorID==NACON_VID&&attr.ProductID==NACON_PID;
 
         if(match) {
             PHIDP_PREPARSED_DATA ppd;
@@ -221,22 +254,20 @@ HANDLE OpenNacon() {
         CloseHandle(ht);
     }
     SetupDiDestroyDeviceInfoList(hdi);
-
     if(bestSize==0) return INVALID_HANDLE_VALUE;
-
     return CreateFile(bestPath,
-        GENERIC_READ|GENERIC_WRITE,
-        FILE_SHARE_READ|FILE_SHARE_WRITE,
+        GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,
         NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  MapNaconToXbox — заполни после реверса через снифер:
-//  1. Запусти, нажми S → снифер включится
-//  2. Нажми кнопку → снифер покажет: B3:00->10
-//     Байт 3, был 0x00, стал 0x10 → это и есть маска кнопки
-//  3. Раскомментируй строку, подставь свой байт и маску
-//  4. Пересобери (Ctrl+Shift+B)
+//  MapNaconToXbox — ЗАПОЛНИ ПОСЛЕ РЕВЕРСА
+//
+//  Как читать sniffer.log:
+//  Нажал кнопку A → в логе появится строка типа:
+//    PKT000042  B5:00->10
+//  Это значит: байт 5, маска 0x10 → это кнопка A
+//  Раскомментируй строку ниже и подставь свои значения.
 // ─────────────────────────────────────────────────────────────────
 XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
     XUSB_REPORT r={};
@@ -249,7 +280,7 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
         return (SHORT)v;
     };
 
-    // ── Кнопки: раскомментируй и подставь байт+маску из снифера ──
+    // ── Кнопки: раскомментируй и подставь байт+маску из sniffer.log ──
     // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_A;
     // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_B;
     // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_X;
@@ -273,7 +304,7 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
     //   case 7:r.wButtons|=XUSB_GAMEPAD_DPAD_UP|XUSB_GAMEPAD_DPAD_LEFT;break;
     // }
 
-    // ── Стики (замени ? на байты из снифера) ──
+    // ── Стики ──
     // r.sThumbLX=toAxis(buf[?],false);
     // r.sThumbLY=toAxis(buf[?],true);
     // r.sThumbRX=toAxis(buf[?],false);
@@ -288,20 +319,21 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
 }
 
 int main() {
+    logOpen();   // открываем sniffer.log сразу при старте
     uiInit(); uiFrame();
     uiStatus(false,false,false,0,0);
     uiSnifferState(false);
 
     const auto client=vigem_alloc();
-    if(!client){uiMsg("FATAL: vigem_alloc failed.",CC_RED);Sleep(3000);return -1;}
+    if(!client){uiMsg("FATAL: vigem_alloc failed.",CC_RED);Sleep(3000);logClose();return -1;}
     if(!VIGEM_SUCCESS(vigem_connect(client))){
         uiMsg("FATAL: ViGEmBus not found. Install the driver.",CC_RED);
-        Sleep(3000);vigem_free(client);return -1;
+        Sleep(3000);vigem_free(client);logClose();return -1;
     }
     const auto pad=vigem_target_x360_alloc();
     if(!VIGEM_SUCCESS(vigem_target_add(client,pad))){
         uiMsg("FATAL: could not create virtual Xbox pad.",CC_RED);
-        Sleep(3000);vigem_target_free(pad);vigem_disconnect(client);vigem_free(client);return -1;
+        Sleep(3000);vigem_target_free(pad);vigem_disconnect(client);vigem_free(client);logClose();return -1;
     }
     uiStatus(true,false,true,0,0);
 
@@ -314,7 +346,7 @@ int main() {
 
     PHIDP_PREPARSED_DATA ppd;
     if(!HidD_GetPreparsedData(hNacon,&ppd)){
-        uiMsg("FATAL: HidD_GetPreparsedData failed.",CC_RED);Sleep(3000);return -1;
+        uiMsg("FATAL: HidD_GetPreparsedData failed.",CC_RED);Sleep(3000);logClose();return -1;
     }
     HIDP_CAPS caps; HidP_GetCaps(ppd,&caps);
     DWORD rSz=caps.InputReportByteLength;
@@ -322,19 +354,29 @@ int main() {
     if(rSz<64) rSz=64;
     uiStatus(true,true,true,rSz,0);
 
+    if(gLog) { fprintf(gLog,"Device found. Packet size: %lu bytes\n\n",rSz); fflush(gLog); }
+
     HG hEv(CreateEvent(NULL,TRUE,FALSE,NULL));
-    if(!hEv.valid()){uiMsg("FATAL: CreateEvent failed.",CC_RED);Sleep(3000);return -1;}
+    if(!hEv.valid()){uiMsg("FATAL: CreateEvent failed.",CC_RED);Sleep(3000);logClose();return -1;}
     OVERLAPPED ov={}; ov.hEvent=hEv;
 
     std::vector<BYTE> rbuf(rSz),pbuf(rSz,0);
     bool running=true,pending=false,snifOn=false;
     DWORD pkts=0;
+    bool firstPacket=true;
 
     while(running){
         if(_kbhit()){
             int k=_getch();
             if(k==27){running=false;break;}
-            if(k=='s'||k=='S'){snifOn=!snifOn;uiSnifferState(snifOn);}
+            if(k=='s'||k=='S'){
+                snifOn=!snifOn;
+                uiSnifferState(snifOn);
+                if(gLog){
+                    fprintf(gLog,"--- Sniffer %s at PKT %lu ---\n",snifOn?"ON":"OFF",pkts);
+                    fflush(gLog);
+                }
+            }
         }
 
         if(!pending){
@@ -363,8 +405,20 @@ int main() {
                 if(br>0){
                     ++pkts;
                     if(br<rSz) memset(rbuf.data()+br,0,rSz-br);
+
+                    // Первый пакет — всегда пишем полный дамп в лог
+                    if(firstPacket){
+                        logFullPacket(pkts,rbuf.data(),br);
+                        firstPacket=false;
+                    }
+
                     uiRawBytes(rbuf.data(),min(br,(DWORD)(HEX_ROWS*HEX_COLS)));
-                    if(snifOn) SnifferDelta(rbuf,pbuf,br);
+
+                    // Снифер пишет и в консоль и в файл
+                    // Лог пишется ВСЕГДА (не только когда snifOn)
+                    // чтобы не пропустить данные пока консоль не видна
+                    SnifferDelta(rbuf,pbuf,br,pkts);
+
                     XUSB_REPORT xr=MapNaconToXbox(rbuf);
                     if(!VIGEM_SUCCESS(vigem_target_x360_update(client,pad,xr)))
                         uiMsg("vigem update error — ViGEm disconnected?",CC_RED);
@@ -382,6 +436,7 @@ int main() {
     vigem_target_free(pad);
     vigem_disconnect(client);
     vigem_free(client);
+    logClose();
     uiRestore();
     return 0;
 }
