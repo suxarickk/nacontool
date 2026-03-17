@@ -1,43 +1,44 @@
-name: Build Nacon EXE
-on: [push, workflow_dispatch]
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup MSVC
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      - name: Download ViGEm SDK
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/ViGEm/ViGEmClient/releases/download/v1.17.333.0/ViGEmClient_v1.17.333.0_x64_x86_ARM64.zip" -OutFile vigem.zip
-          Expand-Archive -Path vigem.zip -DestinationPath vigem_sdk
-          mkdir ViGEm
-          copy vigem_sdk/include/ViGEm/Client.h ViGEm/Client.h
+      - name: Clone ViGEmClient SDK
+        run: git clone --depth=1 https://github.com/nefarius/ViGEmClient.git vigem
+        shell: cmd
 
-      - name: Compile
+      - name: Build ViGEmClient.lib
         run: |
-          cl.exe /O2 /EHsc main.cpp /I. /I./vigem_sdk/include user32.lib shell32.lib hid.lib setupapi.lib ./vigem_sdk/lib/x64/ViGEmClient.lib /link /OUT:nacon_bridge.exe
+          cl.exe /c /O2 /EHsc /W0 /I vigem\include vigem\src\ViGEmClient.cpp /Fo:ViGEmClient.obj
+          lib.exe /OUT:ViGEmClient.lib ViGEmClient.obj
+        shell: cmd
+
+      - name: Compile nacon_bridge.exe
+        run: >
+          cl.exe /O2 /EHsc /W3 main.cpp
+          /I vigem\include
+          user32.lib shell32.lib hid.lib setupapi.lib ViGEmClient.lib
+          /link /OUT:nacon_bridge.exe
+        shell: cmd
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: Nacon-Bridge-EXE
-          path: nacon_bridge.exename: Build Nacon EXE
-on: [push, workflow_dispatch]
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Compile
-        run: |
-          cl.exe /O2 /EHsc main.cpp /I. user32.lib shell32.lib hid.lib setupapi.lib /link /OUT:nacon_bridge.exe
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
-        with:
-          name: Nacon-Bridge-EXE
+          name: nacon_bridge
           path: nacon_bridge.exe
