@@ -10,13 +10,9 @@
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 
-// ─── Настройка устройства ─────────────────────────────────────────
 #define NACON_VID 0x3285
-#define NACON_PID 0x0644   // проверь свой PID: Диспетчер устройств →
-                           // Устройства HID → ПКМ → Свойства →
-                           // Сведения → ИД оборудования → VID_3285&PID_XXXX
+#define NACON_PID 0x0644
 
-// ─── Константы UI ────────────────────────────────────────────────
 constexpr int  UI_W         = 80;
 constexpr int  UI_H         = 24;
 constexpr int  HEX_COLS     = 16;
@@ -25,7 +21,6 @@ constexpr int  SNIFFER_ROWS = 5;
 constexpr int  BAR_LEN      = 5;
 constexpr DWORD MAX_HID_REQ = 4096;
 
-// ─── Цвета консоли ───────────────────────────────────────────────
 enum CC : WORD {
     CC_BLK=0, CC_DGRN=2, CC_DGRY=8, CC_GRN=10,
     CC_CYN=11, CC_RED=12, CC_YEL=14, CC_WHT=15, CC_GRY=7
@@ -33,16 +28,25 @@ enum CC : WORD {
 
 static HANDLE hCon   = INVALID_HANDLE_VALUE;
 static HANDLE hConIn = INVALID_HANDLE_VALUE;
-static FILE*  gLog   = nullptr;
+static FILE*  gLog   = nullptr;   // sniffer.log  — всё подряд
+static FILE*  gErr   = nullptr;   // error.log    — только ошибки
 
-// ─── Логирование ─────────────────────────────────────────────────
+// ─── Двойное логирование ─────────────────────────────────────────
 void logOpen() {
     fopen_s(&gLog, "sniffer.log", "w");
-    if (!gLog) return;
-    fprintf(gLog, "=== Nacon MG-X sniffer log ===\n");
-    fprintf(gLog, "Format: PKT#  B<idx>:<old_hex>-><new_hex>\n\n");
-    fflush(gLog);
+    fopen_s(&gErr, "error.log",   "w");
+    if (gLog) {
+        fprintf(gLog, "=== Nacon sniffer.log ===\n");
+        fprintf(gLog, "Format: PKT#  B<idx>:<old>-><new>\n\n");
+        fflush(gLog);
+    }
+    if (gErr) {
+        fprintf(gErr, "=== Nacon error.log ===\n\n");
+        fflush(gErr);
+    }
 }
+
+// Пишет в sniffer.log
 void logLine(const char* fmt, ...) {
     if (!gLog) return;
     va_list a; va_start(a, fmt);
@@ -51,51 +55,55 @@ void logLine(const char* fmt, ...) {
     fputc('\n', gLog);
     fflush(gLog);
 }
-void logClose() {
-    if (gLog) { fclose(gLog); gLog = nullptr; }
+
+// Пишет в error.log (и дублирует в sniffer.log)
+void logErr(const char* fmt, ...) {
+    va_list a;
+    if (gErr) {
+        va_start(a, fmt);
+        vfprintf(gErr, fmt, a);
+        va_end(a);
+        fputc('\n', gErr);
+        fflush(gErr);
+    }
+    if (gLog) {
+        va_start(a, fmt);
+        fprintf(gLog, "[ERR] ");
+        vfprintf(gLog, fmt, a);
+        va_end(a);
+        fputc('\n', gLog);
+        fflush(gLog);
+    }
 }
 
-// ─── Консольный вывод (WriteConsoleA — без CRT-буферизации) ──────
+void logClose() {
+    if (gLog) { fclose(gLog); gLog = nullptr; }
+    if (gErr) { fclose(gErr); gErr = nullptr; }
+}
+
+// ─── Console output ───────────────────────────────────────────────
 inline void cWrite(const char* s) {
     DWORD n = (DWORD)strlen(s);
     WriteConsoleA(hCon, s, n, &n, NULL);
 }
-void cXY(int x, int y) {
-    COORD c = {(SHORT)x, (SHORT)y};
-    SetConsoleCursorPosition(hCon, c);
-}
-void cCol(CC f, CC b = CC_BLK) {
-    SetConsoleTextAttribute(hCon, (WORD)((b << 4) | f));
-}
-void cPr(int x, int y, const char* s, CC f = CC_GRY, CC b = CC_BLK) {
-    cXY(x, y); cCol(f, b); cWrite(s);
+void cXY(int x, int y) { COORD c={(SHORT)x,(SHORT)y}; SetConsoleCursorPosition(hCon,c); }
+void cCol(CC f, CC b=CC_BLK) { SetConsoleTextAttribute(hCon,(WORD)((b<<4)|f)); }
+void cPr(int x, int y, const char* s, CC f=CC_GRY, CC b=CC_BLK) {
+    cXY(x,y); cCol(f,b); cWrite(s);
 }
 
-// ─── Клавиатура через ReadConsoleInput ───────────────────────────
-// _kbhit/_getch ломаются при нестандартном режиме консоли.
-// ReadConsoleInput работает всегда.
-bool kbCheck(char* outKey) {
-    DWORD n = 0;
-    if (!GetNumberOfConsoleInputEvents(hConIn, &n) || n == 0) return false;
-    INPUT_RECORD rec;
-    DWORD rd = 0;
-    while (PeekConsoleInputA(hConIn, &rec, 1, &rd) && rd > 0) {
-        ReadConsoleInputA(hConIn, &rec, 1, &rd);
-        if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) {
-            *outKey = rec.Event.KeyEvent.uChar.AsciiChar;
-            return true;
-        }
-    }
-    return false;
-}
+// ─── Клавиатура: GetAsyncKeyState — не зависит от консольного режима
+// Надёжнее ReadConsoleInput/kbhit в любых условиях
+bool keyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-// ─── Инициализация консоли ────────────────────────────────────────
+// Детектируем нажатие (переход 0→1) чтобы не повторяться
+static bool prevS   = false;
+static bool prevEsc = false;
+
 void uiInit() {
     hCon   = GetStdHandle(STD_OUTPUT_HANDLE);
     hConIn = GetStdHandle(STD_INPUT_HANDLE);
 
-    // Quick Edit Mode блокирует вывод при клике в окно консоли —
-    // это могло стопорить ReadFile. Отключаем.
     DWORD mode = 0;
     GetConsoleMode(hConIn, &mode);
     mode &= ~ENABLE_QUICK_EDIT_MODE;
@@ -110,8 +118,8 @@ void uiInit() {
     SetConsoleWindowInfo(hCon, TRUE, &wr);
     SetConsoleTitleA("Nacon MG-X -> Xbox 360 Bridge");
     DWORD w; COORD o = {0, 0};
-    FillConsoleOutputCharacterA(hCon, ' ',    UI_W * UI_H, o, &w);
-    FillConsoleOutputAttribute (hCon, CC_GRY, UI_W * UI_H, o, &w);
+    FillConsoleOutputCharacterA(hCon, ' ',    UI_W*UI_H, o, &w);
+    FillConsoleOutputAttribute (hCon, CC_GRY, UI_W*UI_H, o, &w);
 }
 
 void uiRestore() {
@@ -121,7 +129,6 @@ void uiRestore() {
     cXY(0, 23); cWrite("\n");
 }
 
-// ─── Статичная рамка ──────────────────────────────────────────────
 static const char* SEP =
     "--------------------------------------------------------------------------------";
 
@@ -163,182 +170,166 @@ void uiFrame() {
     cPr(43, 22, "sniffer.log", CC_YEL);
 }
 
-// ─── UI-компоненты ────────────────────────────────────────────────
 void uiBtn(int x, int y, const char* l, bool on) {
-    cXY(x, y);
-    cCol(CC_DGRY); cWrite("[");
-    cCol(on ? CC_GRN : CC_DGRY); cWrite(l);
+    cXY(x,y); cCol(CC_DGRY); cWrite("[");
+    cCol(on?CC_GRN:CC_DGRY); cWrite(l);
     cCol(CC_DGRY); cWrite("]");
 }
 void uiBar(int x, int y, BYTE v) {
     int f = v * BAR_LEN / 255;
-    char s[BAR_LEN + 3] = {};
-    s[0] = '[';
-    for (int i = 0; i < BAR_LEN; i++) s[i+1] = (i < f) ? '#' : '.';
-    s[BAR_LEN+1] = ']'; s[BAR_LEN+2] = '\0';
-    cXY(x, y); cCol(v > 10 ? CC_GRN : CC_DGRY); cWrite(s);
+    char s[BAR_LEN+3]={}; s[0]='[';
+    for(int i=0;i<BAR_LEN;i++) s[i+1]=(i<f)?'#':'.';
+    s[BAR_LEN+1]=']'; s[BAR_LEN+2]='\0';
+    cXY(x,y); cCol(v>10?CC_GRN:CC_DGRY); cWrite(s);
 }
 void uiAxis(int x, int y, SHORT v) {
-    char buf[7];
-    snprintf(buf, sizeof(buf), "%+05d", (int)v);
-    cPr(x, y, buf, v != 0 ? CC_YEL : CC_DGRY);
+    char buf[7]; snprintf(buf,sizeof(buf),"%+05d",(int)v);
+    cPr(x,y,buf,v!=0?CC_YEL:CC_DGRY);
 }
-void uiMsg(const char* s, CC fg = CC_YEL) {
-    char pad[82] = {};
-    snprintf(pad, 81, "  %-76s", s);
-    cPr(0, 23, pad, fg);
+void uiMsg(const char* s, CC fg=CC_YEL) {
+    char pad[82]={}; snprintf(pad,81,"  %-76s",s);
+    cPr(0,23,pad,fg);
 }
 void uiClearMsg() {
-    char pad[82]; memset(pad, ' ', 80); pad[80] = '\0';
-    cPr(0, 23, pad, CC_BLK);
+    char pad[82]; memset(pad,' ',80); pad[80]='\0';
+    cPr(0,23,pad,CC_BLK);
 }
 void uiStatus(bool vig, bool nac, bool xbx, DWORD sz, DWORD pkts) {
-    cPr(7,  2, vig ? "[ON] " : "[--] ", vig ? CC_GRN : CC_RED);
-    cPr(24, 2, nac ? "[ON] " : "[--] ", nac ? CC_GRN : CC_RED);
-    cPr(40, 2, xbx ? "[ON] " : "[--] ", xbx ? CC_GRN : CC_RED);
+    cPr(7,  2, vig?"[ON] ":"[--] ", vig?CC_GRN:CC_RED);
+    cPr(24, 2, nac?"[ON] ":"[--] ", nac?CC_GRN:CC_RED);
+    cPr(40, 2, xbx?"[ON] ":"[--] ", xbx?CC_GRN:CC_RED);
     char tmp[20];
-    snprintf(tmp, sizeof(tmp), "%-4lu",  sz);   cPr(55, 2, tmp, CC_YEL);
-    snprintf(tmp, sizeof(tmp), "%-9lu", pkts);  cPr(69, 2, tmp, CC_DGRY);
+    snprintf(tmp,sizeof(tmp),"%-4lu", sz);   cPr(55,2,tmp,CC_YEL);
+    snprintf(tmp,sizeof(tmp),"%-9lu",pkts);  cPr(69,2,tmp,CC_DGRY);
 }
 void uiGamepad(const XUSB_REPORT& r) {
     uiBar(4,  4, r.bLeftTrigger);
     uiBar(70, 4, r.bRightTrigger);
-    uiBtn(13, 4, "LB", (r.wButtons & XUSB_GAMEPAD_LEFT_SHOULDER)  != 0);
-    uiBtn(64, 4, "RB", (r.wButtons & XUSB_GAMEPAD_RIGHT_SHOULDER) != 0);
-    uiBtn(38, 4, "<<", (r.wButtons & XUSB_GAMEPAD_BACK)  != 0);
-    uiBtn(47, 4, "()", (r.wButtons & XUSB_GAMEPAD_GUIDE) != 0);
-    uiBtn(56, 4, ">>", (r.wButtons & XUSB_GAMEPAD_START) != 0);
-    uiBtn(7,  6, "^",  (r.wButtons & XUSB_GAMEPAD_DPAD_UP)    != 0);
-    uiBtn(10, 6, "v",  (r.wButtons & XUSB_GAMEPAD_DPAD_DOWN)  != 0);
-    uiBtn(13, 6, "<",  (r.wButtons & XUSB_GAMEPAD_DPAD_LEFT)  != 0);
-    uiBtn(16, 6, ">",  (r.wButtons & XUSB_GAMEPAD_DPAD_RIGHT) != 0);
-    uiAxis(32, 6, r.sThumbLX); uiAxis(38, 6, r.sThumbLY);
-    uiAxis(54, 6, r.sThumbRX); uiAxis(60, 6, r.sThumbRY);
-    uiBtn(7,  8, "Y",  (r.wButtons & XUSB_GAMEPAD_Y)           != 0);
-    uiBtn(11, 8, "X",  (r.wButtons & XUSB_GAMEPAD_X)           != 0);
-    uiBtn(15, 8, "B",  (r.wButtons & XUSB_GAMEPAD_B)           != 0);
-    uiBtn(19, 8, "A",  (r.wButtons & XUSB_GAMEPAD_A)           != 0);
-    uiBtn(49, 8, "L3", (r.wButtons & XUSB_GAMEPAD_LEFT_THUMB)  != 0);
-    uiBtn(55, 8, "R3", (r.wButtons & XUSB_GAMEPAD_RIGHT_THUMB) != 0);
+    uiBtn(13,4,"LB",(r.wButtons&XUSB_GAMEPAD_LEFT_SHOULDER)!=0);
+    uiBtn(64,4,"RB",(r.wButtons&XUSB_GAMEPAD_RIGHT_SHOULDER)!=0);
+    uiBtn(38,4,"<<",(r.wButtons&XUSB_GAMEPAD_BACK)!=0);
+    uiBtn(47,4,"()",(r.wButtons&XUSB_GAMEPAD_GUIDE)!=0);
+    uiBtn(56,4,">>",(r.wButtons&XUSB_GAMEPAD_START)!=0);
+    uiBtn(7, 6,"^", (r.wButtons&XUSB_GAMEPAD_DPAD_UP)!=0);
+    uiBtn(10,6,"v", (r.wButtons&XUSB_GAMEPAD_DPAD_DOWN)!=0);
+    uiBtn(13,6,"<", (r.wButtons&XUSB_GAMEPAD_DPAD_LEFT)!=0);
+    uiBtn(16,6,">", (r.wButtons&XUSB_GAMEPAD_DPAD_RIGHT)!=0);
+    uiAxis(32,6,r.sThumbLX); uiAxis(38,6,r.sThumbLY);
+    uiAxis(54,6,r.sThumbRX); uiAxis(60,6,r.sThumbRY);
+    uiBtn(7, 8,"Y", (r.wButtons&XUSB_GAMEPAD_Y)!=0);
+    uiBtn(11,8,"X", (r.wButtons&XUSB_GAMEPAD_X)!=0);
+    uiBtn(15,8,"B", (r.wButtons&XUSB_GAMEPAD_B)!=0);
+    uiBtn(19,8,"A", (r.wButtons&XUSB_GAMEPAD_A)!=0);
+    uiBtn(49,8,"L3",(r.wButtons&XUSB_GAMEPAD_LEFT_THUMB)!=0);
+    uiBtn(55,8,"R3",(r.wButtons&XUSB_GAMEPAD_RIGHT_THUMB)!=0);
 }
 void uiRawBytes(const BYTE* buf, DWORD sz) {
     char tmp[4];
-    for (int row = 0; row < HEX_ROWS; row++) {
-        cXY(0, 11 + row);
-        DWORD start = (DWORD)(row * HEX_COLS), drawn = 0;
-        for (DWORD col = 0; col < (DWORD)HEX_COLS && start+col < sz; col++, drawn++) {
-            BYTE b = buf[start+col];
-            cCol(b ? CC_YEL : CC_DGRY);
-            snprintf(tmp, sizeof(tmp), "%02X ", b);
-            cWrite(tmp);
+    for(int row=0;row<HEX_ROWS;row++) {
+        cXY(0,11+row);
+        DWORD start=(DWORD)(row*HEX_COLS), drawn=0;
+        for(DWORD col=0;col<(DWORD)HEX_COLS&&start+col<sz;col++,drawn++) {
+            BYTE b=buf[start+col]; cCol(b?CC_YEL:CC_DGRY);
+            snprintf(tmp,sizeof(tmp),"%02X ",b); cWrite(tmp);
         }
         cCol(CC_DGRY);
-        for (DWORD i = drawn; i < (DWORD)HEX_COLS; i++) cWrite("   ");
+        for(DWORD i=drawn;i<(DWORD)HEX_COLS;i++) cWrite("   ");
     }
 }
 
-// ─── Прокручиваемый буфер снифера ────────────────────────────────
-static char snLines[SNIFFER_ROWS][UI_W + 2] = {};
-static int  snHead = 0;
+static char snLines[SNIFFER_ROWS][UI_W+2]={};
+static int  snHead=0;
 
 void uiSnifferAdd(const char* line) {
-    strncpy_s(snLines[snHead], UI_W+1, line, UI_W);
-    snHead = (snHead + 1) % SNIFFER_ROWS;
-    char pad[UI_W + 2];
-    for (int i = 0; i < SNIFFER_ROWS; i++) {
-        int idx = (snHead + i) % SNIFFER_ROWS;
-        snprintf(pad, sizeof(pad), "%-*s", UI_W, snLines[idx]);
-        cPr(0, 16+i, pad, snLines[idx][0] ? CC_YEL : CC_DGRY);
+    strncpy_s(snLines[snHead],UI_W+1,line,UI_W);
+    snHead=(snHead+1)%SNIFFER_ROWS;
+    char pad[UI_W+2];
+    for(int i=0;i<SNIFFER_ROWS;i++) {
+        int idx=(snHead+i)%SNIFFER_ROWS;
+        snprintf(pad,sizeof(pad),"%-*s",UI_W,snLines[idx]);
+        cPr(0,16+i,pad,snLines[idx][0]?CC_YEL:CC_DGRY);
     }
 }
 void uiSnifferState(bool on) {
-    cPr(9, 15, on ? "[ON] " : "[OFF]", on ? CC_GRN : CC_RED);
+    cPr(9,15,on?"[ON] ":"[OFF]",on?CC_GRN:CC_RED);
 }
 
-// ─── Дельта-снифер ────────────────────────────────────────────────
-// Пишет в файл ВСЕГДА. На экран — только если showOnScreen.
-void SnifferDelta(const std::vector<BYTE>& cur,
-                  std::vector<BYTE>& prev,
+void SnifferDelta(const std::vector<BYTE>& cur, std::vector<BYTE>& prev,
                   DWORD /*sz*/, DWORD pktNum, bool showOnScreen) {
-    DWORD m = (DWORD)min(cur.size(), prev.size());
-    char line[UI_W + 2] = {}; int pos = 0;
-    for (DWORD i = 0; i < m && pos < UI_W - 12; i++) {
-        if (cur[i] != prev[i]) {
-            int n = snprintf(line+pos, UI_W-pos,
-                "B%lu:%02X->%02X  ", i, prev[i], cur[i]);
-            if (n > 0) pos += n;
+    DWORD m=(DWORD)min(cur.size(),prev.size());
+    char line[UI_W+2]={}; int pos=0;
+    for(DWORD i=0;i<m&&pos<UI_W-12;i++) {
+        if(cur[i]!=prev[i]) {
+            int n=snprintf(line+pos,UI_W-pos,"B%lu:%02X->%02X  ",
+                i,prev[i],cur[i]);
+            if(n>0) pos+=n;
         }
     }
-    if (pos > 0) {
-        if (showOnScreen) uiSnifferAdd(line);
+    if(pos>0) {
+        if(showOnScreen) uiSnifferAdd(line);
         logLine("PKT%-6lu  %s", pktNum, line);
     }
-    prev = cur;
+    prev=cur;
 }
 
-// ─── RAII-обёртка для HANDLE ──────────────────────────────────────
 struct HG {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    explicit HG(HANDLE h_ = INVALID_HANDLE_VALUE) : h(h_) {}
-    ~HG() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
-    HG(const HG&) = delete;
-    HG& operator=(const HG&) = delete;
-    void reset(HANDLE nh = INVALID_HANDLE_VALUE) {
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-        h = nh;
+    HANDLE h=INVALID_HANDLE_VALUE;
+    explicit HG(HANDLE h_=INVALID_HANDLE_VALUE):h(h_){}
+    ~HG(){if(h!=INVALID_HANDLE_VALUE)CloseHandle(h);}
+    HG(const HG&)=delete; HG& operator=(const HG&)=delete;
+    void reset(HANDLE nh=INVALID_HANDLE_VALUE){
+        if(h!=INVALID_HANDLE_VALUE)CloseHandle(h); h=nh;
     }
-    operator HANDLE() const { return h; }
-    bool valid() const { return h != INVALID_HANDLE_VALUE; }
+    operator HANDLE()const{return h;}
+    bool valid()const{return h!=INVALID_HANDLE_VALUE;}
 };
 
 // ─────────────────────────────────────────────────────────────────
-//  OpenNacon: перебирает все HID-интерфейсы с нужным VID/PID,
-//  выбирает тот у которого МАКСИМАЛЬНЫЙ InputReportByteLength —
-//  это основной геймпадный интерфейс у MFi-устройств.
-//  Открывает ТОЛЬКО на чтение (GENERIC_READ) — MFi не даёт запись.
+//  OpenNacon — пробует открыть с GENERIC_READ, если не выходит
+//  пробует без прав доступа (0). Логирует каждый шаг в error.log.
 // ─────────────────────────────────────────────────────────────────
 HANDLE OpenNacon() {
     GUID hidGuid; HidD_GetHidGuid(&hidGuid);
-    HDEVINFO hdi = SetupDiGetClassDevs(&hidGuid, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (hdi == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    HDEVINFO hdi=SetupDiGetClassDevs(&hidGuid,NULL,NULL,
+        DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
+    if(hdi==INVALID_HANDLE_VALUE) {
+        logErr("SetupDiGetClassDevs failed: %lu", GetLastError());
+        return INVALID_HANDLE_VALUE;
+    }
 
-    SP_DEVICE_INTERFACE_DATA did = {}; did.cbSize = sizeof(did);
-    char  bestPath[512] = {};
-    DWORD bestSize = 0;
+    SP_DEVICE_INTERFACE_DATA did={}; did.cbSize=sizeof(did);
+    char  bestPath[512]={};
+    DWORD bestSize=0;
 
-    for (int i = 0; SetupDiEnumDeviceInterfaces(hdi, NULL, &hidGuid, i, &did); i++) {
-        DWORD req = 0;
-        SetupDiGetDeviceInterfaceDetail(hdi, &did, NULL, 0, &req, NULL);
-        if (req == 0 || req > MAX_HID_REQ) continue;
+    for(int i=0;SetupDiEnumDeviceInterfaces(hdi,NULL,&hidGuid,i,&did);i++) {
+        DWORD req=0;
+        SetupDiGetDeviceInterfaceDetail(hdi,&did,NULL,0,&req,NULL);
+        if(req==0||req>MAX_HID_REQ) continue;
 
         std::vector<BYTE> buf(req);
-        auto* det = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
-        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-        if (!SetupDiGetDeviceInterfaceDetail(hdi, &did, det, req, NULL, NULL)) continue;
+        auto* det=reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
+        det->cbSize=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        if(!SetupDiGetDeviceInterfaceDetail(hdi,&did,det,req,NULL,NULL)) continue;
 
-        // Проверяем VID/PID без прав доступа
-        HANDLE ht = CreateFile(det->DevicePath, 0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (ht == INVALID_HANDLE_VALUE) continue;
+        HANDLE ht=CreateFile(det->DevicePath,0,
+            FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
+        if(ht==INVALID_HANDLE_VALUE) continue;
 
-        HIDD_ATTRIBUTES attr = {sizeof(attr)};
-        bool match = HidD_GetAttributes(ht, &attr)
-            && attr.VendorID  == NACON_VID
-            && attr.ProductID == NACON_PID;
+        HIDD_ATTRIBUTES attr={sizeof(attr)};
+        bool match=HidD_GetAttributes(ht,&attr)
+            &&attr.VendorID==NACON_VID&&attr.ProductID==NACON_PID;
 
-        if (match) {
+        if(match) {
             PHIDP_PREPARSED_DATA ppd;
-            if (HidD_GetPreparsedData(ht, &ppd)) {
+            if(HidD_GetPreparsedData(ht,&ppd)) {
                 HIDP_CAPS caps;
-                if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS) {
+                if(HidP_GetCaps(ppd,&caps)==HIDP_STATUS_SUCCESS) {
                     logLine("  iface[%d] UsagePage=0x%02X Usage=0x%02X InputLen=%u",
-                        i, caps.UsagePage, caps.Usage,
-                        caps.InputReportByteLength);
-                    if (caps.InputReportByteLength > bestSize) {
-                        bestSize = caps.InputReportByteLength;
-                        strncpy_s(bestPath, sizeof(bestPath),
-                            det->DevicePath, sizeof(bestPath)-1);
+                        i,caps.UsagePage,caps.Usage,caps.InputReportByteLength);
+                    if(caps.InputReportByteLength>bestSize) {
+                        bestSize=caps.InputReportByteLength;
+                        strncpy_s(bestPath,sizeof(bestPath),
+                            det->DevicePath,sizeof(bestPath)-1);
                     }
                 }
                 HidD_FreePreparsedData(ppd);
@@ -348,122 +339,134 @@ HANDLE OpenNacon() {
     }
     SetupDiDestroyDeviceInfoList(hdi);
 
-    if (bestSize == 0) return INVALID_HANDLE_VALUE;
+    if(bestSize==0) {
+        logErr("No matching interface found (VID=%04X PID=%04X)",NACON_VID,NACON_PID);
+        return INVALID_HANDLE_VALUE;
+    }
     logLine("Selected interface InputLen=%u", bestSize);
 
-    // FIX: только GENERIC_READ — MFi-устройства не дают запись,
-    // при GENERIC_READ|GENERIC_WRITE сразу получаем error 1167.
-    HANDLE hr = CreateFile(bestPath,
-        GENERIC_READ,                          // <-- только чтение
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    // Попытка 1: GENERIC_READ (нужен для ReadFile)
+    HANDLE hr=CreateFile(bestPath,
+        GENERIC_READ,
+        FILE_SHARE_READ|FILE_SHARE_WRITE,
+        NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
 
-    if (hr != INVALID_HANDLE_VALUE) {
-        HidD_SetNumInputBuffers(hr, 64);       // увеличиваем буфер HID
+    if(hr==INVALID_HANDLE_VALUE) {
+        logErr("CreateFile GENERIC_READ failed: %lu — trying READ|WRITE",
+            GetLastError());
+        // Попытка 2: GENERIC_READ|GENERIC_WRITE
+        hr=CreateFile(bestPath,
+            GENERIC_READ|GENERIC_WRITE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE,
+            NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+        if(hr==INVALID_HANDLE_VALUE) {
+            logErr("CreateFile READ|WRITE also failed: %lu",GetLastError());
+            return INVALID_HANDLE_VALUE;
+        }
+        logLine("Opened with GENERIC_READ|GENERIC_WRITE");
     } else {
-        logLine("CreateFile failed: %lu", GetLastError());
+        logLine("Opened with GENERIC_READ only");
     }
+
+    HidD_SetNumInputBuffers(hr,64);
+    logLine("HidD_SetNumInputBuffers(64) set");
     return hr;
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  MapNaconToXbox — ЗАПОЛНИ ПОСЛЕ АНАЛИЗА sniffer.log
+//  MapNaconToXbox — заполни после анализа sniffer.log
 //
-//  Порядок:
-//  1. Запусти программу — лог пишется автоматически в sniffer.log
-//  2. Нажми каждую кнопку по одному разу, подвигай стики
-//  3. Нажми ESC, открой sniffer.log
-//  4. Ищи строки: PKT000042  B5:00->10
-//     => байт 5, маска 0x10 — это кнопка
-//  5. Раскомментируй нужную строку, замени ? на свои значения
-//  6. Загрузи обновлённый main.cpp на GitHub — он пересоберётся
+//  Как читать лог:
+//    PKT000042  B5:00->10   <- нажал кнопку, байт 5 стал 0x10
+//    PKT000043  B5:10->00   <- отпустил кнопку
+//  => if (buf[5] & 0x10) r.wButtons |= XUSB_GAMEPAD_A;
+//
+//  Для стиков: байт плавно меняется при движении (не скачок 0→FF)
 // ─────────────────────────────────────────────────────────────────
 XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
-    XUSB_REPORT r = {};
-    if (buf.size() < 12) return r;
+    XUSB_REPORT r={};
+    if(buf.size()<12) return r;
 
-    auto toAxis = [](BYTE b, bool inv) -> SHORT {
-        int v = inv ? (128 - (int)b) : ((int)b - 128);
-        v = v * 256;
-        if (v >  32767) v =  32767;
-        if (v < -32768) v = -32768;
+    auto toAxis=[](BYTE b, bool inv)->SHORT{
+        int v=inv?(128-(int)b):((int)b-128);
+        v=v*256;
+        if(v>32767)v=32767; if(v<-32768)v=-32768;
         return (SHORT)v;
     };
 
     // ── Кнопки ──────────────────────────────────────────────────
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_A;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_B;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_X;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_Y;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_START;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_BACK;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;
-    // if (buf[?] & 0x??) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_A;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_B;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_X;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_Y;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_LEFT_SHOULDER;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_RIGHT_SHOULDER;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_START;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_BACK;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_LEFT_THUMB;
+    // if(buf[?]&0x??) r.wButtons|=XUSB_GAMEPAD_RIGHT_THUMB;
 
-    // ── D-Pad hat-switch (значения 0-7, нейтраль обычно 0x0F) ───
-    // switch (buf[?] & 0x0F) {
-    //     case 0: r.wButtons |= XUSB_GAMEPAD_DPAD_UP;                              break;
-    //     case 1: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_RIGHT; break;
-    //     case 2: r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;                           break;
-    //     case 3: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_RIGHT; break;
-    //     case 4: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;                            break;
-    //     case 5: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_LEFT;  break;
-    //     case 6: r.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;                            break;
-    //     case 7: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_LEFT;  break;
+    // ── D-Pad hat-switch ──
+    // switch(buf[?]&0x0F){
+    //   case 0:r.wButtons|=XUSB_GAMEPAD_DPAD_UP;break;
+    //   case 1:r.wButtons|=XUSB_GAMEPAD_DPAD_UP|XUSB_GAMEPAD_DPAD_RIGHT;break;
+    //   case 2:r.wButtons|=XUSB_GAMEPAD_DPAD_RIGHT;break;
+    //   case 3:r.wButtons|=XUSB_GAMEPAD_DPAD_DOWN|XUSB_GAMEPAD_DPAD_RIGHT;break;
+    //   case 4:r.wButtons|=XUSB_GAMEPAD_DPAD_DOWN;break;
+    //   case 5:r.wButtons|=XUSB_GAMEPAD_DPAD_DOWN|XUSB_GAMEPAD_DPAD_LEFT;break;
+    //   case 6:r.wButtons|=XUSB_GAMEPAD_DPAD_LEFT;break;
+    //   case 7:r.wButtons|=XUSB_GAMEPAD_DPAD_UP|XUSB_GAMEPAD_DPAD_LEFT;break;
     // }
 
-    // ── Стики (центр=0x80, Y у MFi обычно инвертирован) ─────────
-    // r.sThumbLX = toAxis(buf[?], false);
-    // r.sThumbLY = toAxis(buf[?], true);
-    // r.sThumbRX = toAxis(buf[?], false);
-    // r.sThumbRY = toAxis(buf[?], true);
+    // ── Стики ──
+    // r.sThumbLX=toAxis(buf[?],false);
+    // r.sThumbLY=toAxis(buf[?],true);
+    // r.sThumbRX=toAxis(buf[?],false);
+    // r.sThumbRY=toAxis(buf[?],true);
 
-    // ── Триггеры (0x00=отпущен, 0xFF=зажат) ─────────────────────
-    // r.bLeftTrigger  = buf[?];
-    // r.bRightTrigger = buf[?];
+    // ── Триггеры ──
+    // r.bLeftTrigger=buf[?];
+    // r.bRightTrigger=buf[?];
 
     (void)toAxis;
     return r;
 }
 
-// ─── Main ────────────────────────────────────────────────────────
 int main() {
     logOpen();
     uiInit();
     uiFrame();
-    uiStatus(false, false, false, 0, 0);
+    uiStatus(false,false,false,0,0);
     uiSnifferState(false);
 
     // 1. ViGEm
-    const auto client = vigem_alloc();
-    if (!client) {
-        uiMsg("FATAL: vigem_alloc failed.", CC_RED);
-        logLine("FATAL: vigem_alloc"); Sleep(3000); logClose(); return -1;
+    const auto client=vigem_alloc();
+    if(!client){
+        uiMsg("FATAL: vigem_alloc failed.",CC_RED);
+        logErr("vigem_alloc failed"); Sleep(3000); logClose(); return -1;
     }
-    if (!VIGEM_SUCCESS(vigem_connect(client))) {
-        uiMsg("FATAL: ViGEmBus not found. Install the driver.", CC_RED);
-        logLine("FATAL: vigem_connect");
+    if(!VIGEM_SUCCESS(vigem_connect(client))){
+        uiMsg("FATAL: ViGEmBus not found. Install the driver.",CC_RED);
+        logErr("vigem_connect failed");
         Sleep(3000); vigem_free(client); logClose(); return -1;
     }
-    const auto pad = vigem_target_x360_alloc();
-    if (!VIGEM_SUCCESS(vigem_target_add(client, pad))) {
-        uiMsg("FATAL: could not create virtual Xbox pad.", CC_RED);
-        logLine("FATAL: vigem_target_add");
+    const auto pad=vigem_target_x360_alloc();
+    if(!VIGEM_SUCCESS(vigem_target_add(client,pad))){
+        uiMsg("FATAL: could not create virtual Xbox pad.",CC_RED);
+        logErr("vigem_target_add failed");
         Sleep(3000);
         vigem_target_free(pad); vigem_disconnect(client);
         vigem_free(client); logClose(); return -1;
     }
-    uiStatus(true, false, true, 0, 0);
+    uiStatus(true,false,true,0,0);
     logLine("ViGEm OK");
 
     // 2. Ждём Nacon
     HG hNacon;
-    while (!hNacon.valid()) {
+    while(!hNacon.valid()){
         hNacon.reset(OpenNacon());
-        if (!hNacon.valid()) {
-            uiMsg("Waiting for Nacon MG-X — plug in the gamepad...", CC_YEL);
+        if(!hNacon.valid()){
+            uiMsg("Waiting for Nacon MG-X — plug in the gamepad...",CC_YEL);
             Sleep(1500);
         }
     }
@@ -472,145 +475,154 @@ int main() {
 
     // 3. Размер пакета
     PHIDP_PREPARSED_DATA ppd;
-    if (!HidD_GetPreparsedData(hNacon, &ppd)) {
-        uiMsg("FATAL: HidD_GetPreparsedData failed.", CC_RED);
-        logLine("FATAL: HidD_GetPreparsedData");
+    if(!HidD_GetPreparsedData(hNacon,&ppd)){
+        uiMsg("FATAL: HidD_GetPreparsedData failed.",CC_RED);
+        logErr("HidD_GetPreparsedData failed: %lu",GetLastError());
         Sleep(3000); logClose(); return -1;
     }
-    HIDP_CAPS caps2; HidP_GetCaps(ppd, &caps2);
-    DWORD rSz = caps2.InputReportByteLength;
+    HIDP_CAPS caps2; HidP_GetCaps(ppd,&caps2);
+    DWORD rSz=caps2.InputReportByteLength;
     HidD_FreePreparsedData(ppd);
-    if (rSz < 64) rSz = 64;
-    uiStatus(true, true, true, rSz, 0);
-    logLine("Packet size: %lu bytes\n", rSz);
+    if(rSz<64) rSz=64;
+    uiStatus(true,true,true,rSz,0);
+    logLine("Packet size: %lu bytes\n",rSz);
 
     // 4. OVERLAPPED
-    HG hEv(CreateEvent(NULL, TRUE, FALSE, NULL));
-    if (!hEv.valid()) {
-        uiMsg("FATAL: CreateEvent failed.", CC_RED);
-        logLine("FATAL: CreateEvent"); Sleep(3000); logClose(); return -1;
+    HG hEv(CreateEvent(NULL,TRUE,FALSE,NULL));
+    if(!hEv.valid()){
+        uiMsg("FATAL: CreateEvent failed.",CC_RED);
+        logErr("CreateEvent failed: %lu",GetLastError());
+        Sleep(3000); logClose(); return -1;
     }
-    OVERLAPPED ov = {}; ov.hEvent = hEv;
+    OVERLAPPED ov={}; ov.hEvent=hEv;
 
-    std::vector<BYTE> rbuf(rSz), pbuf(rSz, 0);
-    bool running  = true;
-    bool pending  = false;
-    bool snifOn   = false;
-    DWORD pkts    = 0;
-    bool firstPkt = true;
+    std::vector<BYTE> rbuf(rSz), pbuf(rSz,0);
+    bool running=true, pending=false, snifOn=false;
+    DWORD pkts=0;
+    bool firstPkt=true;
+
+    // Диагностика первых 20 итераций цикла
+    int diagCount=0;
 
     // 5. Главный цикл
-    while (running) {
+    while(running){
 
-        // Проверяем клавиши
-        char key = 0;
-        if (kbCheck(&key)) {
-            if (key == 27) { running = false; break; }   // ESC
-            if (key == 's' || key == 'S') {
-                snifOn = !snifOn;
-                uiSnifferState(snifOn);
-                logLine("--- Sniffer %s at PKT %lu ---",
-                    snifOn ? "ON" : "OFF", pkts);
-            }
+        // Клавиши через GetAsyncKeyState — работает без консольного фокуса
+        bool curS   = keyDown('S');
+        bool curEsc = keyDown(VK_ESCAPE);
+
+        if(curEsc && !prevEsc){ running=false; break; }
+        if(curS   && !prevS  ){
+            snifOn=!snifOn;
+            uiSnifferState(snifOn);
+            logLine("--- Sniffer %s at PKT %lu ---",
+                snifOn?"ON":"OFF", pkts);
         }
+        prevS   = curS;
+        prevEsc = curEsc;
 
-        // Запускаем новый асинхронный ReadFile
-        if (!pending) {
+        // Запускаем новый ReadFile
+        if(!pending){
             ResetEvent(ov.hEvent);
-            DWORD imm = 0;
-            BOOL ok = ReadFile(hNacon, rbuf.data(), rSz, &imm, &ov);
-            if (ok) {
-                SetEvent(ov.hEvent);  // данные уже готовы
-                pending = true;
+            DWORD imm=0;
+            BOOL ok=ReadFile(hNacon,rbuf.data(),rSz,&imm,&ov);
+            DWORD rfErr=GetLastError();
+
+            if(diagCount<20){
+                logLine("DIAG ReadFile ok=%d err=%lu",ok,ok?0:rfErr);
+                diagCount++;
+            }
+
+            if(ok){
+                SetEvent(ov.hEvent);
+                pending=true;
+            } else if(rfErr==ERROR_IO_PENDING){
+                pending=true;
             } else {
-                DWORD err = GetLastError();
-                if (err == ERROR_IO_PENDING) {
-                    pending = true;
-                } else {
-                    logLine("ReadFile error: %lu — reconnecting", err);
-                    CancelIoEx(hNacon, NULL);
-                    hNacon.reset();
-                    uiStatus(true, false, true, rSz, pkts);
-                    uiMsg("Nacon disconnected — reconnecting...", CC_YEL);
-                    while (!hNacon.valid()) {
-                        Sleep(2000);
-                        hNacon.reset(OpenNacon());
-                    }
-                    uiClearMsg();
-                    ov.hEvent = hEv;
-                    uiStatus(true, true, true, rSz, pkts);
-                    firstPkt = true;
-                    continue;
+                logErr("ReadFile error: %lu — reconnecting",rfErr);
+                CancelIoEx(hNacon,NULL);
+                hNacon.reset();
+                uiStatus(true,false,true,rSz,pkts);
+                uiMsg("Nacon disconnected — reconnecting...",CC_YEL);
+                while(!hNacon.valid()){
+                    Sleep(2000);
+                    hNacon.reset(OpenNacon());
                 }
+                uiClearMsg();
+                ov.hEvent=hEv;
+                uiStatus(true,true,true,rSz,pkts);
+                firstPkt=true;
+                diagCount=0;
+                continue;
             }
         }
 
-        // Ждём 10 мс — чтобы клавиатура проверялась на каждом витке
-        DWORD wt = WaitForSingleObject(ov.hEvent, 10);
-        if (wt == WAIT_OBJECT_0) {
-            DWORD br = 0;
-            if (GetOverlappedResult(hNacon, &ov, &br, FALSE)) {
-                pending = false;
-                if (br > 0) {
-                    ++pkts;
-                    if (br < rSz) memset(rbuf.data() + br, 0, rSz - br);
+        DWORD wt=WaitForSingleObject(ov.hEvent,10);
 
-                    // Первый пакет — полный дамп в лог
-                    if (firstPkt) {
-                        char raw[256] = {}; int pos = 0;
-                        for (DWORD j = 0; j < br && j < 64 && pos < 250; j++) {
-                            int n = snprintf(raw+pos, sizeof(raw)-pos,
-                                "%02X ", rbuf[j]);
-                            if (n > 0) pos += n;
+        if(wt==WAIT_OBJECT_0){
+            DWORD br=0;
+            if(GetOverlappedResult(hNacon,&ov,&br,FALSE)){
+                pending=false;
+                if(br>0){
+                    ++pkts;
+                    if(br<rSz) memset(rbuf.data()+br,0,rSz-br);
+
+                    if(firstPkt){
+                        char raw[256]={}; int pos=0;
+                        for(DWORD j=0;j<br&&j<64&&pos<250;j++){
+                            int n=snprintf(raw+pos,sizeof(raw)-pos,"%02X ",rbuf[j]);
+                            if(n>0) pos+=n;
                         }
-                        logLine("FIRST_PKT RAW[%lu]: %s", br, raw);
-                        firstPkt = false;
+                        logLine("FIRST_PKT RAW[%lu]: %s",br,raw);
+                        firstPkt=false;
                     }
 
-                    uiRawBytes(rbuf.data(),
-                        min(br, (DWORD)(HEX_ROWS * HEX_COLS)));
+                    uiRawBytes(rbuf.data(),min(br,(DWORD)(HEX_ROWS*HEX_COLS)));
+                    SnifferDelta(rbuf,pbuf,br,pkts,snifOn);
 
-                    // Дельта: в файл всегда, на экран если snifOn
-                    SnifferDelta(rbuf, pbuf, br, pkts, snifOn);
-
-                    XUSB_REPORT xr = MapNaconToXbox(rbuf);
-                    if (!VIGEM_SUCCESS(vigem_target_x360_update(client, pad, xr)))
-                        uiMsg("vigem update error — ViGEm disconnected?", CC_RED);
+                    XUSB_REPORT xr=MapNaconToXbox(rbuf);
+                    if(!VIGEM_SUCCESS(vigem_target_x360_update(client,pad,xr))){
+                        uiMsg("vigem update error",CC_RED);
+                        logErr("vigem_target_x360_update failed at PKT %lu",pkts);
+                    }
                     uiGamepad(xr);
-                    uiStatus(true, true, true, rSz, pkts);
+                    uiStatus(true,true,true,rSz,pkts);
                 }
             } else {
-                DWORD err = GetLastError();
-                if (err != ERROR_IO_INCOMPLETE) {
-                    logLine("GetOverlappedResult error: %lu — reconnecting", err);
-                    pending = false;
-                    CancelIoEx(hNacon, NULL);
+                DWORD err=GetLastError();
+                if(err!=ERROR_IO_INCOMPLETE){
+                    logErr("GetOverlappedResult error: %lu — reconnecting",err);
+                    pending=false;
+                    CancelIoEx(hNacon,NULL);
                     hNacon.reset();
-                    uiStatus(true, false, true, rSz, pkts);
-                    uiMsg("Read error — reconnecting...", CC_YEL);
-                    while (!hNacon.valid()) {
+                    uiStatus(true,false,true,rSz,pkts);
+                    uiMsg("Read error — reconnecting...",CC_YEL);
+                    while(!hNacon.valid()){
                         Sleep(2000);
                         hNacon.reset(OpenNacon());
                     }
                     uiClearMsg();
-                    ov.hEvent = hEv;
-                    uiStatus(true, true, true, rSz, pkts);
-                    firstPkt = true;
+                    ov.hEvent=hEv;
+                    uiStatus(true,true,true,rSz,pkts);
+                    firstPkt=true;
+                    diagCount=0;
                 }
             }
-        } else if (wt != WAIT_TIMEOUT) {
-            logLine("WaitForSingleObject unexpected: %lu", wt);
+        } else if(wt==WAIT_TIMEOUT){
+            // нормально
+        } else {
+            logErr("WaitForSingleObject unexpected: %lu",wt);
             break;
         }
     }
 
     // 6. Очистка
-    if (pending) CancelIoEx(hNacon, NULL);
-    vigem_target_remove(client, pad);
+    if(pending) CancelIoEx(hNacon,NULL);
+    vigem_target_remove(client,pad);
     vigem_target_free(pad);
     vigem_disconnect(client);
     vigem_free(client);
-    logLine("\nSession ended. Total packets: %lu", pkts);
+    logLine("\nSession ended. Total packets: %lu",pkts);
     logClose();
     uiRestore();
     return 0;
