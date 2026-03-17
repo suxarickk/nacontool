@@ -137,17 +137,65 @@ void uiMsg(const char* s, CC fg = CC_YEL) {
 void uiClearMsg() {
     char pad[82]; memset(pad, ' ', 80); pad[80] = '\0';
     cPr(0, 23, pad, CC_BLK);
-}
+HANDLE OpenNacon() {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO hdi = SetupDiGetClassDevs(&hidGuid, NULL, NULL,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (hdi == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 
-void uiStatus(bool vig, bool nac, bool xbx, DWORD sz, DWORD pkts) {
-    cPr(7,  2, vig ? "[ON] " : "[--] ", vig ? CC_GRN : CC_RED);
-    cPr(24, 2, nac ? "[ON] " : "[--] ", nac ? CC_GRN : CC_RED);
-    cPr(40, 2, xbx ? "[ON] " : "[--] ", xbx ? CC_GRN : CC_RED);
-    char tmp[20];
-    snprintf(tmp, sizeof(tmp), "%-4lu",  sz);   cPr(55, 2, tmp, CC_YEL);
-    snprintf(tmp, sizeof(tmp), "%-9lu", pkts);  cPr(69, 2, tmp, CC_DGRY);
-}
+    SP_DEVICE_INTERFACE_DATA did = {};
+    did.cbSize = sizeof(did);
 
+    for (int i = 0; SetupDiEnumDeviceInterfaces(hdi, NULL, &hidGuid, i, &did); i++) {
+        DWORD req = 0;
+        SetupDiGetDeviceInterfaceDetail(hdi, &did, NULL, 0, &req, NULL);
+        if (req == 0 || req > MAX_HID_REQ) continue;
+
+        std::vector<BYTE> buf(req);
+        auto* det = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
+        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        if (!SetupDiGetDeviceInterfaceDetail(hdi, &did, det, req, NULL, NULL)) continue;
+
+        HANDLE ht = CreateFile(det->DevicePath, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (ht == INVALID_HANDLE_VALUE) continue;
+
+        HIDD_ATTRIBUTES attr = {sizeof(attr)};
+        bool match = HidD_GetAttributes(ht, &attr)
+            && attr.VendorID  == NACON_VID
+            && attr.ProductID == NACON_PID;
+
+        // --- НОВАЯ ПРОВЕРКА: Ищем именно геймпад ---
+        bool isGamepad = false;
+        if (match) {
+            PHIDP_PREPARSED_DATA ppd;
+            if (HidD_GetPreparsedData(ht, &ppd)) {
+                HIDP_CAPS caps;
+                if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS) {
+                    // UsagePage 0x01 = Generic Desktop, Usage 0x04/0x05 = Джойстик/Геймпад
+                    if (caps.UsagePage == 0x01 && (caps.Usage == 0x04 || caps.Usage == 0x05)) {
+                        isGamepad = true;
+                    }
+                }
+                HidD_FreePreparsedData(ppd);
+            }
+        }
+        CloseHandle(ht);
+
+        // Если это не геймпад (например, системные кнопки) — пропускаем
+        if (!match || !isGamepad) continue; 
+
+        HANDLE hr = CreateFile(det->DevicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        SetupDiDestroyDeviceInfoList(hdi);
+        return hr;
+    }
+    SetupDiDestroyDeviceInfoList(hdi);
+    return INVALID_HANDLE_VALUE;
+}
 void uiGamepad(const XUSB_REPORT& r) {
     uiBar(4,  4, r.bLeftTrigger);
     uiBar(70, 4, r.bRightTrigger);
