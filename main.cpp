@@ -137,6 +137,17 @@ void uiMsg(const char* s, CC fg = CC_YEL) {
 void uiClearMsg() {
     char pad[82]; memset(pad, ' ', 80); pad[80] = '\0';
     cPr(0, 23, pad, CC_BLK);
+}
+
+void uiStatus(bool vig, bool nac, bool xbx, DWORD sz, DWORD pkts) {
+    cPr(7,  2, vig ? "[ON] " : "[--] ", vig ? CC_GRN : CC_RED);
+    cPr(24, 2, nac ? "[ON] " : "[--] ", nac ? CC_GRN : CC_RED);
+    cPr(40, 2, xbx ? "[ON] " : "[--] ", xbx ? CC_GRN : CC_RED);
+    char tmp[20];
+    snprintf(tmp, sizeof(tmp), "%-4lu",  sz);   cPr(55, 2, tmp, CC_YEL);
+    snprintf(tmp, sizeof(tmp), "%-9lu", pkts);  cPr(69, 2, tmp, CC_DGRY);
+}
+
 HANDLE OpenNacon() {
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
@@ -166,14 +177,13 @@ HANDLE OpenNacon() {
             && attr.VendorID  == NACON_VID
             && attr.ProductID == NACON_PID;
 
-        // --- НОВАЯ ПРОВЕРКА: Ищем именно геймпад ---
+        // --- ИЗМЕНЕНИЕ 1: Ищем именно геймпад (чтобы не зацепить мультимедийные кнопки) ---
         bool isGamepad = false;
         if (match) {
             PHIDP_PREPARSED_DATA ppd;
             if (HidD_GetPreparsedData(ht, &ppd)) {
                 HIDP_CAPS caps;
                 if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS) {
-                    // UsagePage 0x01 = Generic Desktop, Usage 0x04/0x05 = Джойстик/Геймпад
                     if (caps.UsagePage == 0x01 && (caps.Usage == 0x04 || caps.Usage == 0x05)) {
                         isGamepad = true;
                     }
@@ -183,8 +193,8 @@ HANDLE OpenNacon() {
         }
         CloseHandle(ht);
 
-        // Если это не геймпад (например, системные кнопки) — пропускаем
         if (!match || !isGamepad) continue; 
+        // ----------------------------------------------------------------------------------
 
         HANDLE hr = CreateFile(det->DevicePath,
             GENERIC_READ | GENERIC_WRITE,
@@ -196,6 +206,7 @@ HANDLE OpenNacon() {
     SetupDiDestroyDeviceInfoList(hdi);
     return INVALID_HANDLE_VALUE;
 }
+
 void uiGamepad(const XUSB_REPORT& r) {
     uiBar(4,  4, r.bLeftTrigger);
     uiBar(70, 4, r.bRightTrigger);
@@ -290,62 +301,11 @@ struct HG {
     bool valid() const { return h != INVALID_HANDLE_VALUE; }
 };
 
-// ─── Поиск и открытие Nacon ───────────────────────────────────────
-HANDLE OpenNacon() {
-    GUID hidGuid;
-    HidD_GetHidGuid(&hidGuid);
-    HDEVINFO hdi = SetupDiGetClassDevs(&hidGuid, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (hdi == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
-
-    SP_DEVICE_INTERFACE_DATA did = {};
-    did.cbSize = sizeof(did);
-
-    for (int i = 0; SetupDiEnumDeviceInterfaces(hdi, NULL, &hidGuid, i, &did); i++) {
-        DWORD req = 0;
-        SetupDiGetDeviceInterfaceDetail(hdi, &did, NULL, 0, &req, NULL);
-        if (req == 0 || req > MAX_HID_REQ) continue;
-
-        std::vector<BYTE> buf(req);
-        auto* det = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
-        det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-        if (!SetupDiGetDeviceInterfaceDetail(hdi, &did, det, req, NULL, NULL)) continue;
-
-        HANDLE ht = CreateFile(det->DevicePath, 0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (ht == INVALID_HANDLE_VALUE) continue;
-
-        HIDD_ATTRIBUTES attr = {sizeof(attr)};
-        bool match = HidD_GetAttributes(ht, &attr)
-            && attr.VendorID  == NACON_VID
-            && attr.ProductID == NACON_PID;
-        CloseHandle(ht);
-        if (!match) continue;
-
-        HANDLE hr = CreateFile(det->DevicePath,
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-        SetupDiDestroyDeviceInfoList(hdi);
-        return hr;
-    }
-    SetupDiDestroyDeviceInfoList(hdi);
-    return INVALID_HANDLE_VALUE;
-}
-
 // ─── Маппинг Nacon → Xbox 360 ─────────────────────────────────────
-//
-//  КАК ЗАПОЛНИТЬ:
-//  1. Запусти программу, нажми S → снифер включится
-//  2. Зажми одну кнопку → в консоли: B3:00->10
-//     Байт 3, маска 0x10 → эта кнопка
-//  3. Раскомментируй нужную строку, подставь свои значения
-//  4. Пересобери (Ctrl+Shift+B)
-//
 XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
     XUSB_REPORT r = {};
 
-    auto toAxis = [](BYTE b, bool inv) -> SHORT {
+    auto toAxis =[](BYTE b, bool inv) -> SHORT {
         int v = inv ? (128 - (int)b) : ((int)b - 128);
         v = v * 256;
         if (v >  32767) v =  32767;
@@ -353,41 +313,42 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
         return (SHORT)v;
     };
 
+    // --- ИЗМЕНЕНИЕ 2: Убраны двойные слеши (//), код включен ---
     // ── Кнопки ──────────────────────────────────────────────────
-    // if (buf[3] & 0x10) r.wButtons |= XUSB_GAMEPAD_A;
-    // if (buf[3] & 0x20) r.wButtons |= XUSB_GAMEPAD_B;
-    // if (buf[3] & 0x40) r.wButtons |= XUSB_GAMEPAD_X;
-    // if (buf[3] & 0x80) r.wButtons |= XUSB_GAMEPAD_Y;
-    // if (buf[4] & 0x01) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
-    // if (buf[4] & 0x02) r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
-    // if (buf[4] & 0x04) r.wButtons |= XUSB_GAMEPAD_START;
-    // if (buf[4] & 0x08) r.wButtons |= XUSB_GAMEPAD_BACK;
-    // if (buf[4] & 0x40) r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;
-    // if (buf[4] & 0x80) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    if (buf[3] & 0x10) r.wButtons |= XUSB_GAMEPAD_A;
+    if (buf[3] & 0x20) r.wButtons |= XUSB_GAMEPAD_B;
+    if (buf[3] & 0x40) r.wButtons |= XUSB_GAMEPAD_X;
+    if (buf[3] & 0x80) r.wButtons |= XUSB_GAMEPAD_Y;
+    if (buf[4] & 0x01) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+    if (buf[4] & 0x02) r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+    if (buf[4] & 0x04) r.wButtons |= XUSB_GAMEPAD_START;
+    if (buf[4] & 0x08) r.wButtons |= XUSB_GAMEPAD_BACK;
+    if (buf[4] & 0x40) r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;
+    if (buf[4] & 0x80) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
 
     // ── D-Pad hat-switch (значения 0-7, нейтраль=0x0F) ──────────
-    // switch (buf[5] & 0x0F) {
-    //     case 0: r.wButtons |= XUSB_GAMEPAD_DPAD_UP;                              break;
-    //     case 1: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_RIGHT; break;
-    //     case 2: r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;                           break;
-    //     case 3: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_RIGHT; break;
-    //     case 4: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;                            break;
-    //     case 5: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_LEFT;  break;
-    //     case 6: r.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;                            break;
-    //     case 7: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_LEFT;  break;
-    // }
+    switch (buf[5] & 0x0F) {
+        case 0: r.wButtons |= XUSB_GAMEPAD_DPAD_UP;                              break;
+        case 1: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_RIGHT; break;
+        case 2: r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;                           break;
+        case 3: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_RIGHT; break;
+        case 4: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;                            break;
+        case 5: r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN | XUSB_GAMEPAD_DPAD_LEFT;  break;
+        case 6: r.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;                            break;
+        case 7: r.wButtons |= XUSB_GAMEPAD_DPAD_UP   | XUSB_GAMEPAD_DPAD_LEFT;  break;
+    }
 
     // ── Стики (центр=0x80, Y обычно инвертирован у MFi) ─────────
-    // r.sThumbLX = toAxis(buf[6], false);
-    // r.sThumbLY = toAxis(buf[7], true);
-    // r.sThumbRX = toAxis(buf[8], false);
-    // r.sThumbRY = toAxis(buf[9], true);
+    r.sThumbLX = toAxis(buf[6], false);
+    r.sThumbLY = toAxis(buf[7], true);
+    r.sThumbRX = toAxis(buf[8], false);
+    r.sThumbRY = toAxis(buf[9], true);
 
     // ── Триггеры (0x00-0xFF) ─────────────────────────────────────
-    // r.bLeftTrigger  = buf[10];
-    // r.bRightTrigger = buf[11];
+    r.bLeftTrigger  = buf[10];
+    r.bRightTrigger = buf[11];
+    // -------------------------------------------------------------
 
-    (void)toAxis;
     return r;
 }
 
@@ -483,16 +444,20 @@ int main() {
             DWORD br = 0;
             if (GetOverlappedResult(hNacon, &ov, &br, FALSE)) {
                 pending = false;
-                if (br == rSz) {
+
+                // --- ИЗМЕНЕНИЕ 3: Принимаем пакет, даже если размер отличается на байт (br > 0) ---
+                if (br > 0) {
                     ++pkts;
-                    uiRawBytes(rbuf.data(), rSz);
-                    if (snifOn) SnifferDelta(rbuf, pbuf, rSz);
+                    uiRawBytes(rbuf.data(), br);
+                    if (snifOn) SnifferDelta(rbuf, pbuf, br);
                     XUSB_REPORT xr = MapNaconToXbox(rbuf);
                     if (!VIGEM_SUCCESS(vigem_target_x360_update(client, pad, xr)))
                         uiMsg("vigem update error — ViGEm disconnected?", CC_RED);
                     uiGamepad(xr);
                     uiStatus(true, true, true, rSz, pkts);
                 }
+                // ----------------------------------------------------------------------------------
+                
             }
         } else if (wt != WAIT_TIMEOUT) {
             break;
