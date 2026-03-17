@@ -5,6 +5,32 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download ViGEm SDK
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/ViGEm/ViGEmClient/releases/download/v1.17.333.0/ViGEmClient_v1.17.333.0_x64_x86_ARM64.zip" -OutFile vigem.zip
+          Expand-Archive -Path vigem.zip -DestinationPath vigem_sdk
+          mkdir ViGEm
+          copy vigem_sdk/include/ViGEm/Client.h ViGEm/Client.h
+
+      - name: Compile
+        run: |
+          cl.exe /O2 /EHsc main.cpp /I. /I./vigem_sdk/include user32.lib shell32.lib hid.lib setupapi.lib ./vigem_sdk/lib/x64/ViGEmClient.lib /link /OUT:nacon_bridge.exe
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nacon-Bridge-EXE
+          path: nacon_bridge.exename: Build Nacon EXE
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
       - name: Compile
