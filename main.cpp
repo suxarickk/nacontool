@@ -25,21 +25,18 @@ constexpr DWORD MAX_HID_REQ  = 4096;
 constexpr DWORD PKT_MAX      = 256;
 
 enum CC : WORD {
-    CC_BLK=0, CC_DGRN=2, CC_DGRY=8, CC_GRN=10,
-    CC_CYN=11, CC_RED=12, CC_YEL=14, CC_WHT=15, CC_GRY=7
+    CC_BLK=0,CC_DGRN=2,CC_DGRY=8,CC_GRN=10,
+    CC_CYN=11,CC_RED=12,CC_YEL=14,CC_WHT=15,CC_GRY=7
 };
 
 static HANDLE hCon   = INVALID_HANDLE_VALUE;
 static HANDLE hConIn = INVALID_HANDLE_VALUE;
 static FILE*  gLog   = nullptr;
-static FILE*  gErr   = nullptr;
 
-// ─── Logging ──────────────────────────────────────────────────────
+// ─── Logging (один файл) ──────────────────────────────────────────
 void logOpen(){
     fopen_s(&gLog,"sniffer.log","w");
-    fopen_s(&gErr,"error.log","w");
     if(gLog){ fprintf(gLog,"=== sniffer.log ===\n\n"); fflush(gLog); }
-    if(gErr){ fprintf(gErr,"=== error.log ===\n\n");   fflush(gErr); }
 }
 void logLine(const char* fmt,...){
     if(!gLog) return;
@@ -47,20 +44,18 @@ void logLine(const char* fmt,...){
     fputc('\n',gLog); fflush(gLog);
 }
 void logErr(const char* fmt,...){
-    va_list a;
-    if(gErr){ va_start(a,fmt); vfprintf(gErr,fmt,a); va_end(a); fputc('\n',gErr); fflush(gErr); }
-    if(gLog){ fprintf(gLog,"[ERR] "); va_start(a,fmt); vfprintf(gLog,fmt,a); va_end(a); fputc('\n',gLog); fflush(gLog); }
+    if(!gLog) return;
+    fprintf(gLog,"[ERR] ");
+    va_list a; va_start(a,fmt); vfprintf(gLog,fmt,a); va_end(a);
+    fputc('\n',gLog); fflush(gLog);
 }
-void logClose(){
-    if(gLog){ fclose(gLog); gLog=nullptr; }
-    if(gErr){ fclose(gErr); gErr=nullptr; }
-}
+void logClose(){ if(gLog){ fclose(gLog); gLog=nullptr; } }
 
 // ─── Shared buffer ────────────────────────────────────────────────
 struct SharedPacket {
-    BYTE  data[PKT_MAX] = {};
-    DWORD size           = 0;
-    bool  ready          = false;
+    BYTE  data[PKT_MAX]={};
+    DWORD size=0;
+    bool  ready=false;
     CRITICAL_SECTION cs;
 };
 static SharedPacket gPkt;
@@ -75,7 +70,7 @@ void uiInit(){
     hCon  =GetStdHandle(STD_OUTPUT_HANDLE);
     hConIn=GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode=0; GetConsoleMode(hConIn,&mode);
-    mode &= ~ENABLE_QUICK_EDIT_MODE; mode |= ENABLE_EXTENDED_FLAGS;
+    mode&=~ENABLE_QUICK_EDIT_MODE; mode|=ENABLE_EXTENDED_FLAGS;
     SetConsoleMode(hConIn,mode);
     CONSOLE_CURSOR_INFO ci={1,FALSE}; SetConsoleCursorInfo(hCon,&ci);
     COORD sz={(SHORT)UI_W,(SHORT)UI_H}; SetConsoleScreenBufferSize(hCon,sz);
@@ -92,10 +87,10 @@ void uiRestore(){
 }
 static const char* SEP="--------------------------------------------------------------------------------";
 void uiFrame(){
-    cPr(0,0,"  NACON MG-X",CC_CYN);  cPr(12,0," -> ",CC_DGRY); cPr(16,0,"XBOX 360 BRIDGE",CC_GRN);
+    cPr(0,0,"  NACON MG-X",CC_CYN); cPr(12,0," -> ",CC_DGRY); cPr(16,0,"XBOX 360 BRIDGE",CC_GRN);
     cPr(0,1,SEP,CC_DGRY);
-    cPr(1,2,"ViGEm:",CC_DGRY); cPr(18,2,"Nacon:",CC_DGRY);
-    cPr(35,2,"Xbox:",CC_DGRY); cPr(50,2,"Size:",CC_DGRY); cPr(64,2,"Pkts:",CC_DGRY);
+    cPr(1,2,"ViGEm:",CC_DGRY); cPr(18,2,"Nacon:",CC_DGRY); cPr(35,2,"Xbox:",CC_DGRY);
+    cPr(50,2,"Size:",CC_DGRY); cPr(64,2,"Pkts:",CC_DGRY);
     cPr(0,3,SEP,CC_DGRY);
     cPr(0,4,"  LT",CC_DGRY); cPr(11,4,"LB",CC_DGRY); cPr(34,4,"BACK",CC_DGRY);
     cPr(42,4,"GUIDE",CC_DGRY); cPr(51,4,"START",CC_DGRY); cPr(62,4,"RB",CC_DGRY); cPr(68,4,"RT",CC_DGRY);
@@ -225,7 +220,7 @@ bool FindBestNaconInterface(char* outPath,size_t pathMax,DWORD* outSize){
     if(hdi==INVALID_HANDLE_VALUE){ logErr("SetupDiGetClassDevs: %lu",GetLastError()); return false; }
 
     SP_DEVICE_INTERFACE_DATA did={}; did.cbSize=sizeof(did);
-    bool  foundGP=false, found=false;
+    bool foundGP=false,found=false;
     DWORD bestSize=0;
 
     logLine("--- HID interface scan ---");
@@ -239,7 +234,7 @@ bool FindBestNaconInterface(char* outPath,size_t pathMax,DWORD* outSize){
         det->cbSize=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
         if(!SetupDiGetDeviceInterfaceDetail(hdi,&did,det,req,NULL,NULL)) continue;
 
-        HANDLE ht=CreateFile(det->DevicePath,0,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
+        HANDLE ht=CreateFileA(det->DevicePath,0,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
         if(ht==INVALID_HANDLE_VALUE) continue;
 
         HIDD_ATTRIBUTES attr={sizeof(attr)};
@@ -260,9 +255,9 @@ bool FindBestNaconInterface(char* outPath,size_t pathMax,DWORD* outSize){
         if(attr.VendorID==NACON_VID&&attr.ProductID==NACON_PID){
             bool isGP=(up==0x01&&(use==0x04||use==0x05));
             if(isGP&&!foundGP){
-                logLine("  ^-- GAMEPAD selected"); foundGP=true; found=true;
+                logLine("  ^-- GAMEPAD selected");
                 strncpy_s(outPath,pathMax,det->DevicePath,pathMax-1);
-                bestSize=inLen;
+                bestSize=inLen; foundGP=true; found=true;
             } else if(!foundGP&&inLen>bestSize){
                 logLine("  ^-- fallback (InLen=%u Usage=0x%02X)",inLen,use);
                 strncpy_s(outPath,pathMax,det->DevicePath,pathMax-1);
@@ -279,72 +274,12 @@ bool FindBestNaconInterface(char* outPath,size_t pathMax,DWORD* outSize){
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  TrySendWakeup
-//
-//  Nacon MG-X в Android-режиме требует инициализации перед тем
-//  как начать слать данные. Пробуем все известные wake-up пакеты.
-//  err=31 и err=1 — нормально, устройство может всё равно
-//  "проснуться" после попытки.
-// ─────────────────────────────────────────────────────────────────
-void TrySendWakeup(HANDLE hDev,DWORD pktSize){
-    logLine("-- Wake-up sequence --");
-
-    // Структура wake-up пакетов: {report_id, byte1, byte2, ...}
-    // Для Nacon/BigBen контроллеров известны следующие инициализации:
-    struct WakeCmd { BYTE id; BYTE b1; BYTE b2; BYTE b3; const char* note; };
-    static const WakeCmd cmds[]={
-        {0x00,0x00,0x00,0x00,"zero"},
-        {0x01,0x00,0x00,0x00,"id1"},
-        {0x02,0x00,0x00,0x00,"id2"},
-        {0x05,0x01,0x00,0x00,"id5 mode1"},  // типичный для BigBen
-        {0x05,0x09,0x00,0x00,"id5 mode9"},
-        {0x0B,0x01,0x00,0x00,"id0B"},
-        {0xF0,0x55,0x00,0x00,"idF0 magic"},
-        {0x02,0x02,0x00,0x00,"id2 v2"},
-    };
-
-    std::vector<BYTE> w(max(pktSize,(DWORD)8),0);
-
-    for(auto& c : cmds){
-        // Попытка SetOutputReport
-        memset(w.data(),0,w.size());
-        if(w.size()>0) w[0]=c.id;
-        if(w.size()>1) w[1]=c.b1;
-        if(w.size()>2) w[2]=c.b2;
-        if(w.size()>3) w[3]=c.b3;
-        BOOL ok=HidD_SetOutputReport(hDev,w.data(),(ULONG)min((DWORD)w.size(),pktSize));
-        logLine("  OutRpt id=0x%02X [%s]: %s err=%lu",c.id,c.note,ok?"OK":"fail",ok?0:GetLastError());
-
-        // Попытка SetFeature с теми же данными
-        memset(w.data(),0,w.size());
-        if(w.size()>0) w[0]=c.id;
-        if(w.size()>1) w[1]=c.b1;
-        ok=HidD_SetFeature(hDev,w.data(),(ULONG)min((DWORD)w.size(),pktSize));
-        logLine("  Feature id=0x%02X [%s]: %s err=%lu",c.id,c.note,ok?"OK":"fail",ok?0:GetLastError());
-    }
-    Sleep(100); // ждём реакции устройства
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  ReadThread
-//
-//  Стратегия (по убыванию приоритета):
-//
-//  [A] HidD_GetInputReport — перебор Report ID 0x00..0x03, 0x10, 0x20
-//      Если хотя бы один даёт непустой ответ → polling @ ~125 Hz
-//
-//  [B] ReadFile блокирующий на существующем sync-хэндле
-//      КЛЮЧЕВОЕ ОТЛИЧИЕ от предыдущих версий:
-//      • Не открываем новый хэндл — читаем через тот же что и главный поток
-//      • Sync ReadFile блокируется до прихода данных или закрытия хэндла
-//      • Именно закрытие hDev из main() разблокирует ReadFile и завершает поток
-//      • Перебираем размеры буфера: 64, 65, 32, 128 байт
-//        (некоторые устройства игнорируют чтение с "неправильным" размером)
-//
-//  Остановка: main() делает ctx->stop=true, затем CloseHandle(hDev)
+//  ReadCtx — devPath хранится здесь, передаётся напрямую в поток.
+//  Никакого GetFinalPathNameByHandle.
 // ─────────────────────────────────────────────────────────────────
 struct ReadCtx {
     HANDLE        hDev;
+    char          devPath[512]; // путь для overlapped хэндла
     DWORD         pktSize;
     HANDLE        hNewPkt;
     volatile bool stop;
@@ -359,223 +294,279 @@ static void PushPacket(const BYTE* data,DWORD sz,HANDLE ev){
     SetEvent(ev);
 }
 
-static void LogFirstPkt(const char* method,const BYTE* data,DWORD sz){
+static void LogFirstPkt(const char* method,const BYTE* d,DWORD sz){
     char raw[512]={}; int pos=0;
     for(DWORD j=0;j<sz&&j<48&&pos<490;j++){
-        int n=snprintf(raw+pos,sizeof(raw)-pos,"%02X ",data[j]);
+        int n=snprintf(raw+pos,sizeof(raw)-pos,"%02X ",d[j]);
         if(n>0) pos+=n;
     }
     logLine("FIRST_PKT [%s] size=%lu  RAW: %s",method,sz,raw);
 }
 
+// ─────────────────────────────────────────────────────────────────
+//  OpenOverlapped — открывает overlapped хэндл по пути из ctx.
+//  Сначала GENERIC_READ, затем READ|WRITE.
+// ─────────────────────────────────────────────────────────────────
+static HANDLE OpenOverlapped(const char* path){
+    HANDLE h=CreateFileA(path,GENERIC_READ,
+                          FILE_SHARE_READ|FILE_SHARE_WRITE,
+                          NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+    if(h==INVALID_HANDLE_VALUE){
+        h=CreateFileA(path,GENERIC_READ|GENERIC_WRITE,
+                       FILE_SHARE_READ|FILE_SHARE_WRITE,
+                       NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+    }
+    return h;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  ReadFile loop (overlapped) — основной цикл чтения.
+//  Таймаут 500 мс между попытками чтобы реагировать на ctx->stop.
+// ─────────────────────────────────────────────────────────────────
+static bool RunReadFileLoop(ReadCtx* ctx,HANDLE hOv,DWORD bufSize){
+    HANDLE hEv=CreateEvent(NULL,TRUE,FALSE,NULL);
+    if(!hEv) return false;
+
+    std::vector<BYTE> buf(bufSize,0);
+    bool first=true;
+    bool gotAny=false;
+
+    while(!ctx->stop){
+        OVERLAPPED ov={}; ov.hEvent=hEv;
+        ResetEvent(hEv);
+        DWORD br=0;
+        BOOL ok=ReadFile(hOv,buf.data(),bufSize,&br,&ov);
+        DWORD err=GetLastError();
+
+        if(!ok){
+            if(err==ERROR_IO_PENDING){
+                DWORD wt=WaitForSingleObject(hEv,500);
+                if(wt==WAIT_TIMEOUT){
+                    if(ctx->stop){ CancelIo(hOv); GetOverlappedResult(hOv,&ov,&br,TRUE); break; }
+                    continue;
+                }
+                if(wt!=WAIT_OBJECT_0) break;
+                if(!GetOverlappedResult(hOv,&ov,&br,FALSE)){
+                    err=GetLastError();
+                    if(err==ERROR_INVALID_HANDLE||err==ERROR_DEVICE_NOT_CONNECTED||
+                       err==ERROR_OPERATION_ABORTED) break;
+                    logErr("GOR err=%lu",err); Sleep(50); continue;
+                }
+            } else {
+                if(err==ERROR_INVALID_HANDLE||err==ERROR_DEVICE_NOT_CONNECTED||
+                   err==ERROR_OPERATION_ABORTED) break;
+                logErr("ReadFile err=%lu",err); Sleep(50); continue;
+            }
+        }
+        if(br==0) continue;
+        gotAny=true;
+        if(first){ LogFirstPkt("ReadFile",buf.data(),br); first=false; }
+        PushPacket(buf.data(),br,ctx->hNewPkt);
+    }
+
+    CloseHandle(hEv);
+    return gotAny;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  ReadThread
+//
+//  Методы по убыванию приоритета:
+//
+//  [A] HidD_GetFeature  — для MFi/кастомных HID устройств которые
+//      используют Feature-reports для передачи состояния.
+//      Многие iOS-ориентированные контроллеры идут именно этим путём.
+//      Перебираем ID: 0x00..0x03, 0x10, 0x20, 0x40.
+//
+//  [B] HidD_GetInputReport — стандартный poll.
+//      На Usage=0x00 обычно err=31, но пробуем.
+//
+//  [C] ReadFile overlapped с перебором размеров буфера.
+//      FIX: используем ctx->devPath напрямую (не GetFinalPathNameByHandle).
+//      Пробуем: 64, 65, 32, 16, 128, 8 байт, по 2 секунды каждый.
+//
+//  [D] Блокирующий ReadFile на sync-хэндле (последний шанс).
+//      Закрытие hDev из main() разблокирует вызов.
+// ─────────────────────────────────────────────────────────────────
 DWORD WINAPI ReadThread(LPVOID param){
     ReadCtx* ctx=reinterpret_cast<ReadCtx*>(param);
-    logLine("ReadThread started pktSize=%lu",ctx->pktSize);
+    logLine("ReadThread started pktSize=%lu  path=%s",ctx->pktSize,ctx->devPath);
 
-    // ── Wake-up ──────────────────────────────────────────────────
-    TrySendWakeup(ctx->hDev,ctx->pktSize);
+    std::vector<BYTE> buf(max(ctx->pktSize,(DWORD)128),0);
 
-    // ── [A] Попытка HidD_GetInputReport ──────────────────────────
+    // ── [A] HidD_GetFeature ───────────────────────────────────────
+    // MFi контроллеры часто передают данные через Feature reports,
+    // а не через Input reports. Это главное отличие от стандартных HID.
     {
-        static const BYTE ids[]={0x00,0x01,0x02,0x03,0x10,0x20};
-        std::vector<BYTE> buf(ctx->pktSize,0);
-        BYTE workingID=0xFF;
+        static const BYTE fids[]={0x00,0x01,0x02,0x03,0x10,0x20,0x40,0x11,0x12};
+        logLine("-- Probing HidD_GetFeature IDs --");
+        BYTE workID=0xFF;
 
-        logLine("-- Probing GetInputReport IDs --");
-        for(BYTE id:ids){
+        for(BYTE id:fids){
             memset(buf.data(),0,ctx->pktSize); buf[0]=id;
-            BOOL ok=HidD_GetInputReport(ctx->hDev,buf.data(),ctx->pktSize);
+            BOOL ok=HidD_GetFeature(ctx->hDev,buf.data(),ctx->pktSize);
             DWORD err=GetLastError();
-            logLine("  ID=0x%02X ok=%d err=%lu",id,(int)ok,ok?0:err);
+            logLine("  GetFeature ID=0x%02X ok=%d err=%lu",id,(int)ok,ok?0:err);
             if(ok){
                 bool nz=false;
-                for(DWORD j=1;j<ctx->pktSize;j++) if(buf[j]){nz=true;break;}
-                if(nz){ workingID=id; logLine("  ^-- ID 0x%02X WORKS!",id); break; }
+                for(DWORD j=0;j<ctx->pktSize;j++) if(buf[j]){nz=true;break;}
+                if(nz){
+                    char raw[256]={}; int pos=0;
+                    for(DWORD j=0;j<ctx->pktSize&&j<16&&pos<240;j++){
+                        int n=snprintf(raw+pos,sizeof(raw)-pos,"%02X ",buf[j]);
+                        if(n>0) pos+=n;
+                    }
+                    logLine("  ^-- GetFeature ID=0x%02X WORKS! RAW: %s",id,raw);
+                    workID=id; break;
+                }
                 logLine("  ^-- all-zeros, skip");
             }
         }
 
-        if(workingID!=0xFF){
-            logLine("METHOD: GetInputReport polling ID=0x%02X",workingID);
+        if(workID!=0xFF){
+            logLine("METHOD: GetFeature polling ID=0x%02X",workID);
             bool first=true;
             while(!ctx->stop){
-                memset(buf.data(),0,ctx->pktSize); buf[0]=workingID;
+                memset(buf.data(),0,ctx->pktSize); buf[0]=workID;
+                BOOL ok=HidD_GetFeature(ctx->hDev,buf.data(),ctx->pktSize);
+                if(!ok){
+                    DWORD e=GetLastError();
+                    if(e==ERROR_INVALID_HANDLE||e==ERROR_DEVICE_NOT_CONNECTED) break;
+                    logErr("GetFeature loop err=%lu",e); Sleep(50); continue;
+                }
+                if(first){ LogFirstPkt("GetFeature",buf.data(),ctx->pktSize); first=false; }
+                PushPacket(buf.data(),ctx->pktSize,ctx->hNewPkt);
+                Sleep(8); // ~125 Hz
+            }
+            logLine("ReadThread [GetFeature] done");
+            return 0;
+        }
+    }
+
+    // ── [B] HidD_GetInputReport ───────────────────────────────────
+    {
+        static const BYTE iids[]={0x00,0x01,0x02,0x03,0x10,0x20};
+        logLine("-- Probing HidD_GetInputReport IDs --");
+        BYTE workID=0xFF;
+
+        for(BYTE id:iids){
+            memset(buf.data(),0,ctx->pktSize); buf[0]=id;
+            BOOL ok=HidD_GetInputReport(ctx->hDev,buf.data(),ctx->pktSize);
+            DWORD err=GetLastError();
+            logLine("  GetInputReport ID=0x%02X ok=%d err=%lu",id,(int)ok,ok?0:err);
+            if(ok){
+                bool nz=false;
+                for(DWORD j=1;j<ctx->pktSize;j++) if(buf[j]){nz=true;break;}
+                if(nz){ logLine("  ^-- WORKS!"); workID=id; break; }
+                logLine("  ^-- all-zeros, skip");
+            }
+        }
+
+        if(workID!=0xFF){
+            logLine("METHOD: GetInputReport polling ID=0x%02X",workID);
+            bool first=true;
+            while(!ctx->stop){
+                memset(buf.data(),0,ctx->pktSize); buf[0]=workID;
                 BOOL ok=HidD_GetInputReport(ctx->hDev,buf.data(),ctx->pktSize);
                 if(!ok){
                     DWORD e=GetLastError();
                     if(e==ERROR_INVALID_HANDLE||e==ERROR_DEVICE_NOT_CONNECTED) break;
-                    logErr("GetInputReport err=%lu",e); Sleep(50); continue;
+                    logErr("GetInputReport loop err=%lu",e); Sleep(50); continue;
                 }
                 if(first){ LogFirstPkt("GetInputReport",buf.data(),ctx->pktSize); first=false; }
                 PushPacket(buf.data(),ctx->pktSize,ctx->hNewPkt);
-                Sleep(8); // ~125 Hz
+                Sleep(8);
             }
             logLine("ReadThread [GetInputReport] done");
             return 0;
         }
     }
 
-    // ── [B] ReadFile sync на существующем хэндле ─────────────────
+    // ── [C] ReadFile overlapped — перебор размеров ────────────────
     //
-    //  Перебираем размеры буфера: устройство может молчать если
-    //  размер не совпадает с ожидаемым. 64 = без report-ID байта,
-    //  65 = с report-ID, 32/128 = на случай нестандартного размера.
+    //  FIX: ctx->devPath передаётся напрямую из main().
+    //  Никакого GetFinalPathNameByHandle — он не работает на HID-хэндлах.
     //
-    //  Каждый размер пробуем ReadFile дважды с таймаутом 2 сек:
-    //    - если пришли данные → переходим к основному циклу
-    //    - если нет → пробуем следующий размер
-    //
-    //  Для "таймаута" на sync ReadFile используем отдельный поток
-    //  который закроет копию хэндла через 2 сек если данных нет.
-    //  Проще: используем overlapped только для probe, потом sync.
+    //  Для каждого размера открываем отдельный overlapped хэндл,
+    //  пробуем 2 секунды. Если данные пришли — запускаем основной цикл.
+    {
+        static const DWORD sizes[]={64,65,32,16,128,8};
+        logLine("-- Probing ReadFile with overlapped handle (path from ctx) --");
 
-    static const DWORD probeSizes[]={64,65,32,128,8,16};
-    logLine("-- Probing ReadFile with different buffer sizes --");
+        for(DWORD probeSize:sizes){
+            if(ctx->stop) break;
+            logLine("  Trying ReadFile size=%lu ...",probeSize);
 
-    for(DWORD probeSize:probeSizes){
-        if(ctx->stop) break;
-        logLine("  Trying ReadFile size=%lu ...",probeSize);
+            HANDLE hProbe=OpenOverlapped(ctx->devPath);
+            if(hProbe==INVALID_HANDLE_VALUE){
+                logErr("  Cannot open overlapped handle: %lu",GetLastError());
+                break; // путь нерабочий — дальше пробовать смысла нет
+            }
 
-        // Используем overlapped + таймаут 2000 мс для пробы каждого размера
-        // НО через тот же sync-хэндл это невозможно. Поэтому для зонда
-        // открываем временный overlapped хэндл, пробуем, закрываем.
-        // Для основного цикла используем sync-хэндл (блокирующий).
+            HANDLE hEv=CreateEvent(NULL,TRUE,FALSE,NULL);
+            std::vector<BYTE> pbuf(probeSize,0);
+            OVERLAPPED pov={}; pov.hEvent=hEv;
+            DWORD br=0;
+            BOOL ok=ReadFile(hProbe,pbuf.data(),probeSize,&br,&pov);
+            DWORD err=GetLastError();
+            bool gotData=false;
 
-        // Получить путь устройства из sync-хэндла нельзя напрямую.
-        // Используем NtQueryObject / GetFinalPathNameByHandle (Win Vista+)
-        char devPathBuf[512]={};
-        DWORD nameLen=GetFinalPathNameByHandleA(ctx->hDev,devPathBuf,sizeof(devPathBuf)-1,FILE_NAME_NORMALIZED);
-        if(nameLen==0||nameLen>=sizeof(devPathBuf)){
-            logLine("  GetFinalPathNameByHandle failed (%lu), skip overlapped probe",GetLastError());
-            break; // не можем получить путь, переходим к блокирующему ReadFile
-        }
-        // GetFinalPathNameByHandle возвращает \\?\... префикс, он работает с CreateFile
-        logLine("  Path: %s",devPathBuf);
-
-        HANDLE hProbe=CreateFileA(devPathBuf,
-                                   GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
-                                   NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-        if(hProbe==INVALID_HANDLE_VALUE){
-            hProbe=CreateFileA(devPathBuf,
-                                GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,
-                                NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-        }
-        if(hProbe==INVALID_HANDLE_VALUE){
-            logLine("  Cannot open probe handle (%lu)",GetLastError());
-            continue;
-        }
-
-        HANDLE hEv=CreateEvent(NULL,TRUE,FALSE,NULL);
-        std::vector<BYTE> pbuf(probeSize,0);
-        OVERLAPPED ov={}; ov.hEvent=hEv;
-        ResetEvent(hEv);
-        DWORD br=0;
-        BOOL ok=ReadFile(hProbe,pbuf.data(),probeSize,&br,&ov);
-        DWORD err=GetLastError();
-        bool gotData=false;
-
-        if(!ok&&err==ERROR_IO_PENDING){
-            DWORD wt=WaitForSingleObject(hEv,2000); // 2 сек на пробу
-            if(wt==WAIT_OBJECT_0&&GetOverlappedResult(hProbe,&ov,&br,FALSE)&&br>0){
+            if(!ok&&err==ERROR_IO_PENDING){
+                DWORD wt=WaitForSingleObject(hEv,2000);
+                if(wt==WAIT_OBJECT_0&&GetOverlappedResult(hProbe,&pov,&br,FALSE)&&br>0)
+                    gotData=true;
+                else
+                    CancelIo(hProbe); // таймаут — отменяем
+            } else if(ok&&br>0){
                 gotData=true;
             }
-        } else if(ok&&br>0){
-            gotData=true;
-        }
 
-        CloseHandle(hEv);
-        CloseHandle(hProbe);
+            CloseHandle(hEv);
+            CloseHandle(hProbe);
 
-        if(gotData){
-            logLine("  ReadFile works with size=%lu! First bytes: %02X %02X %02X %02X",
-                    probeSize,
-                    br>0?pbuf[0]:0,br>1?pbuf[1]:0,
-                    br>2?pbuf[2]:0,br>3?pbuf[3]:0);
-            // Нашли рабочий размер — уточняем и запускаем основной цикл
-            // Открываем финальный overlapped хэндл для основного чтения
+            if(gotData){
+                logLine("  ReadFile works! size=%lu  bytes: %02X %02X %02X %02X",
+                        probeSize,
+                        br>0?pbuf[0]:0,br>1?pbuf[1]:0,
+                        br>2?pbuf[2]:0,br>3?pbuf[3]:0);
 
-            // Переоткрываем снова для основного цикла
-            HANDLE hFinal=CreateFileA(devPathBuf,
-                                       GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
-                                       NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-            if(hFinal==INVALID_HANDLE_VALUE){
-                hFinal=CreateFileA(devPathBuf,
-                                    GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,
-                                    NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
-            }
-            if(hFinal==INVALID_HANDLE_VALUE){
-                logErr("Cannot open final overlapped handle: %lu",GetLastError());
-                break;
-            }
-
-            HANDLE hEvMain=CreateEvent(NULL,TRUE,FALSE,NULL);
-            std::vector<BYTE> mbuf(probeSize,0);
-            bool first=true;
-            logLine("METHOD: ReadFile OVERLAPPED size=%lu",probeSize);
-
-            while(!ctx->stop){
-                OVERLAPPED mov={}; mov.hEvent=hEvMain;
-                ResetEvent(hEvMain);
-                DWORD mbr=0;
-                BOOL mok=ReadFile(hFinal,mbuf.data(),probeSize,&mbr,&mov);
-                DWORD merr=GetLastError();
-                if(!mok){
-                    if(merr==ERROR_IO_PENDING){
-                        DWORD mwt=WaitForSingleObject(hEvMain,500);
-                        if(mwt==WAIT_TIMEOUT){
-                            if(ctx->stop){ CancelIo(hFinal); GetOverlappedResult(hFinal,&mov,&mbr,TRUE); break; }
-                            continue;
-                        }
-                        if(mwt!=WAIT_OBJECT_0) break;
-                        if(!GetOverlappedResult(hFinal,&mov,&mbr,FALSE)){
-                            merr=GetLastError();
-                            if(merr==ERROR_INVALID_HANDLE||merr==ERROR_DEVICE_NOT_CONNECTED||merr==ERROR_OPERATION_ABORTED) break;
-                            logErr("GOR err=%lu",merr); Sleep(50); continue;
-                        }
-                    } else {
-                        if(merr==ERROR_INVALID_HANDLE||merr==ERROR_DEVICE_NOT_CONNECTED||merr==ERROR_OPERATION_ABORTED) break;
-                        logErr("ReadFile err=%lu",merr); Sleep(50); continue;
-                    }
+                // Открываем финальный overlapped хэндл для основного цикла
+                HANDLE hFinal=OpenOverlapped(ctx->devPath);
+                if(hFinal==INVALID_HANDLE_VALUE){
+                    logErr("Cannot open final overlapped handle: %lu",GetLastError());
+                    break;
                 }
-                if(mbr==0) continue;
-                if(first){ LogFirstPkt("ReadFile",mbuf.data(),mbr); first=false; }
-                PushPacket(mbuf.data(),mbr,ctx->hNewPkt);
+                logLine("METHOD: ReadFile OVERLAPPED size=%lu",probeSize);
+                RunReadFileLoop(ctx,hFinal,probeSize);
+                CloseHandle(hFinal);
+                logLine("ReadThread [ReadFile OVERLAPPED] done");
+                return 0;
             }
-
-            CloseHandle(hEvMain);
-            CloseHandle(hFinal);
-            logLine("ReadThread [ReadFile] done");
-            return 0;
+            logLine("  size=%lu: no data in 2s",probeSize);
         }
-
-        logLine("  size=%lu: no data",probeSize);
     }
 
-    // ── [C] Последний шанс: блокирующий ReadFile на sync-хэндле ──
+    // ── [D] Блокирующий ReadFile на sync-хэндле ──────────────────
     //
-    //  Если overlapped probe не сработал (нет пути или данных нет ни
-    //  с каким размером) — пробуем самый примитивный вариант:
-    //  обычный блокирующий ReadFile на нашем sync-хэндле.
-    //  Поток просто висит до прихода первого байта или закрытия хэндла.
-    //  Некоторые USB HID устройства не отвечают на overlapped запросы
-    //  но отдают данные через sync ReadFile (поведение зависит от
-    //  реализации HID minidriver в Windows).
+    //  Последний шанс. ReadFile блокируется до:
+    //    • прихода данных от устройства
+    //    • закрытия hDev из main() → err=ERROR_INVALID_HANDLE → выход
+    //
+    //  Для MFi: данные не придут без Apple-аутентификации,
+    //  но этот метод покрывает edge-case когда все overlapped пробы
+    //  молча проваливались из-за особенностей конкретного HID minidriver.
     {
         logLine("METHOD: Blocking ReadFile on sync handle (last resort)");
         std::vector<BYTE> bbuf(ctx->pktSize,0);
         bool first=true;
-
         while(!ctx->stop){
             DWORD br=0;
-            // Блокируется до данных или закрытия хэндла из main()
             BOOL ok=ReadFile(ctx->hDev,bbuf.data(),ctx->pktSize,&br,NULL);
             if(!ok){
                 DWORD e=GetLastError();
-                // Эти коды = нормальное завершение при закрытии хэндла
                 if(e==ERROR_INVALID_HANDLE||e==ERROR_DEVICE_NOT_CONNECTED||
                    e==ERROR_OPERATION_ABORTED||e==ERROR_BROKEN_PIPE) break;
-                logErr("Blocking ReadFile err=%lu",e);
-                Sleep(50); continue;
+                logErr("Blocking ReadFile err=%lu",e); Sleep(50); continue;
             }
             if(br==0) continue;
             if(first){ LogFirstPkt("BlockingReadFile",bbuf.data(),br); first=false; }
@@ -583,7 +574,7 @@ DWORD WINAPI ReadThread(LPVOID param){
         }
     }
 
-    logLine("ReadThread done (no data from device)");
+    logLine("ReadThread done");
     return 0;
 }
 
@@ -669,11 +660,13 @@ int main(){
     // 2. Nacon ────────────────────────────────────────────────────
     DWORD devSize=0;
     HG hNacon;
-    char devPath[512]={};
 
     while(!hNacon.valid()){
+        char devPath[512]={};
         if(FindBestNaconInterface(devPath,sizeof(devPath),&devSize)){
-            // Открываем синхронный хэндл READ+WRITE (для wake-up и GetInputReport)
+            // Сохраняем путь в контексте потока ДО открытия хэндла
+            strncpy_s(rtCtx.devPath,sizeof(rtCtx.devPath),devPath,sizeof(devPath)-1);
+
             HANDLE h=CreateFileA(devPath,GENERIC_READ|GENERIC_WRITE,
                                   FILE_SHARE_READ|FILE_SHARE_WRITE,
                                   NULL,OPEN_EXISTING,0,NULL);
@@ -684,7 +677,7 @@ int main(){
                                NULL,OPEN_EXISTING,0,NULL);
             }
             if(h!=INVALID_HANDLE_VALUE){
-                logLine("Opened sync handle OK");
+                logLine("Sync handle opened OK");
                 HidD_SetNumInputBuffers(h,64);
                 hNacon.reset(h);
             }
@@ -697,22 +690,25 @@ int main(){
     uiClearMsg();
 
     DWORD rSz=devSize;
-    { PHIDP_PREPARSED_DATA ppd;
-      if(HidD_GetPreparsedData(hNacon,&ppd)){
-          HIDP_CAPS c2; HidP_GetCaps(ppd,&c2);
-          if(c2.InputReportByteLength>rSz) rSz=c2.InputReportByteLength;
-          HidD_FreePreparsedData(ppd);
-      }
+    {
+        PHIDP_PREPARSED_DATA ppd;
+        if(HidD_GetPreparsedData(hNacon,&ppd)){
+            HIDP_CAPS c2; HidP_GetCaps(ppd,&c2);
+            if(c2.InputReportByteLength>rSz) rSz=c2.InputReportByteLength;
+            HidD_FreePreparsedData(ppd);
+        }
     }
-    if(rSz<8) rSz=8;
+    if(rSz<8)       rSz=8;
     if(rSz>PKT_MAX) rSz=PKT_MAX;
 
     uiStatus(true,true,true,rSz,0);
-    logLine("Nacon OK, packet size: %lu",rSz);
+    logLine("Nacon OK, packet size: %lu  path: %s",rSz,rtCtx.devPath);
 
     // 3. Read thread ───────────────────────────────────────────────
     HG hNewPkt(CreateEvent(NULL,FALSE,FALSE,NULL));
-    if(!hNewPkt.valid()){ uiMsg("FATAL: CreateEvent",CC_RED); logErr("CreateEvent"); Sleep(3000); logClose(); return -1; }
+    if(!hNewPkt.valid()){
+        uiMsg("FATAL: CreateEvent",CC_RED); logErr("CreateEvent"); Sleep(3000); logClose(); return -1;
+    }
 
     rtCtx.hDev    =hNacon;
     rtCtx.pktSize =rSz;
@@ -720,7 +716,10 @@ int main(){
     rtCtx.stop    =false;
 
     HANDLE hThread=CreateThread(NULL,0,ReadThread,&rtCtx,0,NULL);
-    if(!hThread){ uiMsg("FATAL: CreateThread",CC_RED); logErr("CreateThread: %lu",GetLastError()); Sleep(3000); logClose(); return -1; }
+    if(!hThread){
+        uiMsg("FATAL: CreateThread",CC_RED); logErr("CreateThread: %lu",GetLastError());
+        Sleep(3000); logClose(); return -1;
+    }
     logLine("Read thread started");
 
     std::vector<BYTE> rbuf(rSz,0),pbuf(rSz,0);
@@ -741,7 +740,11 @@ int main(){
 
         DWORD sz=0;
         EnterCriticalSection(&gPkt.cs);
-        if(gPkt.ready){ sz=min(gPkt.size,(DWORD)rSz); memcpy(rbuf.data(),gPkt.data,sz); gPkt.ready=false; }
+        if(gPkt.ready){
+            sz=min(gPkt.size,(DWORD)rSz);
+            memcpy(rbuf.data(),gPkt.data,sz);
+            gPkt.ready=false;
+        }
         LeaveCriticalSection(&gPkt.cs);
         if(sz==0) continue;
 
@@ -758,10 +761,8 @@ int main(){
     }
 
     // 5. Cleanup ───────────────────────────────────────────────────
-    // Порядок важен: stop=true → закрыть хэндл → ждать поток
-    // Закрытие хэндла разблокирует ReadFile/GetInputReport в потоке
     rtCtx.stop=true;
-    hNacon.reset(); // разблокирует поток
+    hNacon.reset(); // разблокирует блокирующий ReadFile/GetFeature в потоке
 
     if(WaitForSingleObject(hThread,3000)==WAIT_TIMEOUT){
         logErr("ReadThread timeout — terminating"); TerminateThread(hThread,0);
