@@ -176,37 +176,27 @@ HANDLE OpenNacon() {
         bool match = HidD_GetAttributes(ht, &attr)
             && attr.VendorID  == NACON_VID
             && attr.ProductID == NACON_PID;
-
-        // --- ИЗМЕНЕНИЕ 1: Ищем именно геймпад (чтобы не зацепить мультимедийные кнопки) ---
-        bool isGamepad = false;
-        if (match) {
-            PHIDP_PREPARSED_DATA ppd;
-            if (HidD_GetPreparsedData(ht, &ppd)) {
-                HIDP_CAPS caps;
-                if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS) {
-                    if (caps.UsagePage == 0x01 && (caps.Usage == 0x04 || caps.Usage == 0x05)) {
-                        isGamepad = true;
-                    }
-                }
-                HidD_FreePreparsedData(ppd);
-            }
-        }
         CloseHandle(ht);
 
-        if (!match || !isGamepad) continue; 
-        // ----------------------------------------------------------------------------------
+        // Если VID и PID не совпали — ищем дальше
+        if (!match) continue; 
 
+        // Пытаемся открыть интерфейс для чтения кнопок
         HANDLE hr = CreateFile(det->DevicePath,
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-        SetupDiDestroyDeviceInfoList(hdi);
-        return hr;
+        
+        // Если интерфейс заблокирован Windows (например, мышь/клавиатура),
+        // hr будет равен INVALID_HANDLE_VALUE. Тогда мы не выходим, а просто проверяем следующий!
+        if (hr != INVALID_HANDLE_VALUE) {
+            SetupDiDestroyDeviceInfoList(hdi);
+            return hr;
+        }
     }
     SetupDiDestroyDeviceInfoList(hdi);
     return INVALID_HANDLE_VALUE;
 }
-
 void uiGamepad(const XUSB_REPORT& r) {
     uiBar(4,  4, r.bLeftTrigger);
     uiBar(70, 4, r.bRightTrigger);
