@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <conio.h>
-
+ 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 
