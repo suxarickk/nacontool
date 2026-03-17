@@ -329,7 +329,7 @@ HANDLE OpenNacon() {
     logLine("Selected interface with InputLen=%u", bestSize);
 
     HANDLE hr = CreateFile(bestPath,
-        GENERIC_READ | GENERIC_WRITE,
+        GENERIC_READ
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 
