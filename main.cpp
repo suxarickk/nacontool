@@ -10,8 +10,8 @@
 #include <cstring>
 #include <cstdarg>
 #include <atomic>
-#include <initguid.h>    // для DEFINE_GUID
-#include <usbiodef.h>    // для GUID_DEVINTERFACE_USB_DEVICE
+#include <initguid.h>
+#include <usbiodef.h>
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -31,7 +31,6 @@ constexpr int   BAR_LEN      = 5;
 constexpr DWORD MAX_HID_REQ  = 4096;
 constexpr DWORD PKT_MAX      = 256;
 
-// ─── WinUSB GUID (после установки через Zadig) ───────────────────
 DEFINE_GUID(GUID_WINUSB_NACON,
     0xdee824ef, 0x729b, 0x4a0e,
     0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17);
@@ -41,7 +40,6 @@ enum CC : WORD {
     CC_CYN=11, CC_RED=12, CC_YEL=14, CC_WHT=15, CC_GRY=7
 };
 
-// ─── Режим работы ─────────────────────────────────────────────────
 enum WorkMode {
     MODE_UNKNOWN  = 0,
     MODE_HID      = 1,
@@ -79,7 +77,7 @@ struct SharedPacket {
 };
 static SharedPacket gPkt;
 
-// ─── Console ──────────────────────────────────────────────────────
+// ─── Console UI ───────────────────────────────────────────────────
 inline void cWrite(const char* s){ DWORD n=(DWORD)strlen(s);WriteConsoleA(hCon,s,n,&n,NULL); }
 void cXY(int x,int y){ COORD c={(SHORT)x,(SHORT)y};SetConsoleCursorPosition(hCon,c); }
 void cCol(CC f,CC b=CC_BLK){ SetConsoleTextAttribute(hCon,(WORD)((b<<4)|f)); }
@@ -121,20 +119,14 @@ void uiFrame(){
     cPr(20,22,"[ESC]",CC_YEL);cPr(25,22," exit",CC_DGRY);
     cPr(38,22,"log->",CC_DGRY);cPr(43,22,"sniffer.log",CC_YEL);
 }
-void uiBtn(int x,int y,const char* l,bool on){
-    cXY(x,y);cCol(CC_DGRY);cWrite("[");cCol(on?CC_GRN:CC_DGRY);cWrite(l);cCol(CC_DGRY);cWrite("]");
-}
+void uiBtn(int x,int y,const char* l,bool on){ cXY(x,y);cCol(CC_DGRY);cWrite("[");cCol(on?CC_GRN:CC_DGRY);cWrite(l);cCol(CC_DGRY);cWrite("]"); }
 void uiBar(int x,int y,BYTE v){
     int f=v*BAR_LEN/255;char s[BAR_LEN+3]={};s[0]='[';
     for(int i=0;i<BAR_LEN;i++)s[i+1]=(i<f)?'#':'.';s[BAR_LEN+1]=']';s[BAR_LEN+2]='\0';
     cXY(x,y);cCol(v>10?CC_GRN:CC_DGRY);cWrite(s);
 }
-void uiAxis(int x,int y,SHORT v){
-    char b[7];snprintf(b,sizeof(b),"%+05d",(int)v);cPr(x,y,b,v!=0?CC_YEL:CC_DGRY);
-}
-void uiMsg(const char* s,CC fg=CC_YEL){
-    char pad[82]={};snprintf(pad,81,"  %-76s",s);cPr(0,23,pad,fg);
-}
+void uiAxis(int x,int y,SHORT v){ char b[7];snprintf(b,sizeof(b),"%+05d",(int)v);cPr(x,y,b,v!=0?CC_YEL:CC_DGRY); }
+void uiMsg(const char* s,CC fg=CC_YEL){ char pad[82]={};snprintf(pad,81,"  %-76s",s);cPr(0,23,pad,fg); }
 void uiClearMsg(){char pad[82];memset(pad,' ',80);pad[80]='\0';cPr(0,23,pad,CC_BLK);}
 void uiStatus(bool vig,bool nac,bool xbx,WorkMode mode,DWORD pkts){
     cPr(7,2,  vig?"[ON] ":"[--] ",vig?CC_GRN:CC_RED);
@@ -193,8 +185,7 @@ void uiSnifferAdd(const char* line){
     }
 }
 void uiSnifferState(bool on){ cPr(9,15,on?"[ON] ":"[OFF]",on?CC_GRN:CC_RED); }
-void SnifferDelta(const std::vector<BYTE>& cur,std::vector<BYTE>& prev,
-                  DWORD sz,DWORD pktNum,bool show){
+void SnifferDelta(const std::vector<BYTE>& cur,std::vector<BYTE>& prev,DWORD sz,DWORD pktNum,bool show){
     DWORD m=(DWORD)min((size_t)sz,min(cur.size(),prev.size()));
     char line[UI_W+2]={};int pos=0;
     for(DWORD i=0;i<m&&pos<UI_W-12;i++){
@@ -224,7 +215,7 @@ struct WinUSBDevice {
     HANDLE          hFile     = INVALID_HANDLE_VALUE;
     WINUSB_INTERFACE_HANDLE hUsb = nullptr;
     UCHAR           epIn      = 0;
-    ULONG           maxPkt    = 65;
+    ULONG           maxPkt    = 64; 
     bool            ready     = false;
 
     bool Open(const char* path) {
@@ -252,6 +243,11 @@ struct WinUSBDevice {
             return false;
         }
 
+        // Выводим данные интерфейса в лог для отладки
+        logLine("Interface 0: Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
+                ifDesc.bInterfaceClass, ifDesc.bInterfaceSubClass, 
+                ifDesc.bInterfaceProtocol, ifDesc.bNumEndpoints);
+
         bool foundIn = false;
         for (UCHAR ep = 0; ep < ifDesc.bNumEndpoints; ep++) {
             WINUSB_PIPE_INFORMATION pipe = {};
@@ -259,8 +255,8 @@ struct WinUSBDevice {
 
             if (pipe.PipeType == UsbdPipeTypeInterrupt && (pipe.PipeId & 0x80) != 0 && !foundIn) {
                 epIn    = pipe.PipeId;
-                // Увеличиваем буфер до 65 байт для гарантии (рекомендация #3)
-                maxPkt  = max((ULONG)pipe.MaximumPacketSize, 65UL);
+                // БЕРЕМ ТОЧНЫЙ РАЗМЕР из дескриптора без всяких хаков с max()
+                maxPkt  = pipe.MaximumPacketSize; 
                 foundIn = true;
                 logLine("  Selected Interrupt IN: 0x%02X, MaxPkt: %lu", epIn, maxPkt);
             }
@@ -268,20 +264,22 @@ struct WinUSBDevice {
 
         if (!foundIn) {
             epIn   = 0x81;
-            maxPkt = 65;
-            logLine("Falling back to default endpoint 0x81");
+            maxPkt = 64; // Fallback
+            logLine("Falling back to default endpoint 0x81, MaxPkt 64");
         }
 
-        ULONG rawIo = 1;
+        // Отключаем RAW_IO. RAW_IO заставляет WinUSB быть очень строгим к размерам буфера.
+        // Без него драйвер сам склеит/обрежет пакет, что безопаснее для отладки MFi.
+        ULONG rawIo = 0; 
         WinUsb_SetPipePolicy(hUsb, epIn, RAW_IO, sizeof(rawIo), &rawIo);
-        ULONG timeout = 500;
+        
+        ULONG timeout = 1000;
         WinUsb_SetPipePolicy(hUsb, epIn, PIPE_TRANSFER_TIMEOUT, sizeof(timeout), &timeout);
 
         ready = true;
         return true;
     }
 
-    // Рекомендация #1: Отправка iAP2 запросов
     bool SendControlRequest(UCHAR bmRequestType, UCHAR bRequest, USHORT wValue, USHORT wIndex, UCHAR* data, USHORT dataLength) {
         if (!hUsb || !ready) return false;
         WINUSB_SETUP_PACKET setup = {};
@@ -291,23 +289,27 @@ struct WinUSBDevice {
         setup.Index = wIndex;
         setup.Length = dataLength;
         ULONG transferred = 0;
-        return WinUsb_ControlTransfer(hUsb, setup, data, dataLength, &transferred, NULL) == TRUE;
+        BOOL ok = WinUsb_ControlTransfer(hUsb, setup, data, dataLength, &transferred, NULL);
+        if(!ok) logErr("ControlTransfer failed. req:%02X val:%04X err:%lu", bRequest, wValue, GetLastError());
+        return ok == TRUE;
     }
 
     void AggressiveWakeUp() {
-        logLine("Sending WinUSB iAP2 / WakeUp control requests...");
+        logLine("Sending Enhanced MFi WakeUp...");
         BYTE buf[64] = {0};
 
-        // Отправка магических последовательностей для активации геймпада
-        SendControlRequest(0x21, 0x09, 0x0300, 0, buf, 64);
-        SendControlRequest(0x21, 0x09, 0x0301, 0, buf, 64);
+        // Попытка 1: Стандартный HID-пинок (Output Report ID 0x01)
+        SendControlRequest(0x21, 0x09, 0x0201, 0, buf, 64); 
+        
+        // Попытка 2: Переключение режима (Force Active)
+        buf[0] = 0x04; buf[1] = 0x00; 
         SendControlRequest(0x21, 0x09, 0x0302, 0, buf, 64);
-        SendControlRequest(0x21, 0x09, 0x0303, 0, buf, 64);
 
-        // Отправка запросов с данными 0x55 0xAA (потенциальный Feature Report)
-        buf[0] = 0x55; buf[1] = 0xAA;
-        SendControlRequest(0x21, 0x09, 0x03F0, 0, buf, 64);
-        logLine("WakeUp sequence sent.");
+        // Попытка 3: Нулевой Feature Report на ID 0x00
+        memset(buf, 0, 64);
+        SendControlRequest(0x21, 0x09, 0x0300, 0, buf, 64);
+        
+        logLine("WakeUp sequence finished.");
     }
 
     void Close() {
@@ -395,7 +397,6 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
 
         if (isN) logLine("  Found NACON: VID=%04X PID=%04X Page=%02X Use=%02X InLen=%u", attr.VendorID, attr.ProductID, up, use, inLen);
 
-        // Рекомендация #2 (Исправление логики): Берем только Nacon!
         if (isN && isGP && !f1) { p1[0]='\0'; strncpy_s(p1, sizeof(p1), det->DevicePath, sizeof(p1)-1); s1=inLen; f1=true; gp1=true; }
         if (isN && !isGP && !f3) { p3[0]='\0'; strncpy_s(p3, sizeof(p3), det->DevicePath, sizeof(p3)-1); s3=inLen; f3=true; gp3=false; }
         
@@ -404,7 +405,6 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
     SetupDiDestroyDeviceInfoList(hdi);
     logLine("=== SCAN END ===");
 
-    // Правильный приоритет (сначала Nacon Gamepad, затем Nacon Raw)
     if (f1) { strncpy_s(outPath, pathMax, p1, pathMax-1); if(outSize)*outSize=s1; if(isGamepad)*isGamepad=gp1; return true; }
     if (f3) { strncpy_s(outPath, pathMax, p3, pathMax-1); if(outSize)*outSize=s3; if(isGamepad)*isGamepad=gp3; return true; }
     return false;
@@ -421,7 +421,6 @@ struct ReadCtx {
     WorkMode          mode     = MODE_UNKNOWN;
     HANDLE            hNewPkt  = INVALID_HANDLE_VALUE;
     
-    // Безопасные флаги управления (Рекомендация #5)
     std::atomic<bool> stop{false};
     std::atomic<bool> disconnected{false}; 
 };
@@ -456,79 +455,81 @@ DWORD WINAPI ReadThread(LPVOID param) {
     ReadCtx* ctx = reinterpret_cast<ReadCtx*>(param);
     logLine("ReadThread started  mode=%s  pktSize=%lu", ctx->mode == MODE_WINUSB ? "WINUSB" : "HID", ctx->pktSize);
 
-    // ── WinUSB режим (Асинхронное чтение) ──────────────────────
+    // ── WinUSB режим (Исправленный с защитой от порчи Overlapped) ──
     if (ctx->mode == MODE_WINUSB && ctx->pUsb) {
-        logLine("METHOD: WinUSB Overlapped endpoint read");
-        std::vector<BYTE> buf(max(ctx->pktSize, (DWORD)256), 0);
-        bool first = true;
+        logLine("METHOD: WinUSB Interrupt Read (Fixed)");
+        
+        // ВАЖНО: Размер буфера строго равен MaxPkt (полученному из дескриптора)
+        DWORD readSize = ctx->pUsb->maxPkt; 
+        std::vector<BYTE> buf(readSize, 0);
         
         HANDLE wEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         OVERLAPPED wov = {};
         wov.hEvent = wEvent;
-        bool wPending = false;
+        bool first = true;
+        bool pending = false;
 
         while (!ctx->stop) {
-            if (!wPending) {
-                memset(&wov, 0, sizeof(wov));
-                wov.hEvent = wEvent;
+            // Запускаем асинхронное чтение только если нет ожидающего!
+            if (!pending) {
                 ResetEvent(wEvent);
                 DWORD br0 = 0;
-                BOOL imm = WinUsb_ReadPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn, buf.data(), (DWORD)buf.size(), &br0, &wov);
-                DWORD e0 = GetLastError();
+                BOOL ok = WinUsb_ReadPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn, buf.data(), readSize, &br0, &wov);
+                DWORD err = GetLastError();
 
-                if (imm && br0 > 0) {
-                    if (first) { LogFirstPkt("WinUSB", buf.data(), br0); first = false; }
-                    PushPacket(buf.data(), br0, ctx->hNewPkt);
-                    continue;
+                if (ok) { 
+                    // Данные получены моментально
+                    if (br0 > 0) {
+                        if (first) { LogFirstPkt("WinUSB", buf.data(), br0); first = false; }
+                        PushPacket(buf.data(), br0, ctx->hNewPkt);
+                    }
+                    continue; // Сразу идем на следующую итерацию
                 }
-                if (!imm && e0 != ERROR_IO_PENDING) {
-                    if (e0 == ERROR_DEVICE_NOT_CONNECTED || e0 == ERROR_NO_SUCH_DEVICE) break;
-                    Sleep(10); continue;
+
+                if (err != ERROR_IO_PENDING) {
+                    logErr("WinUsb_ReadPipe fatal error: %lu", err);
+                    break;
                 }
-                wPending = true;
+                pending = true; // Запрос отправлен в драйвер, ждем
             }
 
-            DWORD mwt = WaitForSingleObject(wEvent, 500);
-            if (mwt == WAIT_TIMEOUT) {
-                if (ctx->stop) {
+            // Ждем завершения
+            DWORD wait = WaitForSingleObject(wEvent, 1000);
+            
+            if (wait == WAIT_TIMEOUT) {
+                if (ctx->stop) { // Если попросили остановиться во время таймаута
                     WinUsb_AbortPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn);
                     DWORD tmp = 0; GetOverlappedResult(ctx->pUsb->hFile, &wov, &tmp, TRUE);
                     break;
                 }
-                continue;
+                continue; // Важно: pending остается TRUE, на след. итерации мы снова будем только ждать!
             }
-            if (mwt != WAIT_OBJECT_0) break;
-
-            DWORD mbr = 0;
-            if (!GetOverlappedResult(ctx->pUsb->hFile, &wov, &mbr, FALSE)) {
-                DWORD merr = GetLastError();
-                if (merr == ERROR_DEVICE_NOT_CONNECTED || merr == ERROR_OPERATION_ABORTED) break;
-                wPending = false; Sleep(10); continue;
-            }
-            wPending = false;
-            if (mbr > 0) {
-                // Рекомендация #4: Проверка первого байта
-                if (buf[0] == 0x00 && mbr > 1) {
-                    static bool loggedZero = false;
-                    if (!loggedZero) { logLine("WinUSB Note: Packet starts with 0x00. Possible no Report ID."); loggedZero = true; }
+            
+            if (wait == WAIT_OBJECT_0) {
+                DWORD br = 0;
+                if (GetOverlappedResult(ctx->pUsb->hFile, &wov, &br, FALSE)) {
+                    if (br > 0) {
+                        if (first) { LogFirstPkt("WinUSB", buf.data(), br); first = false; }
+                        PushPacket(buf.data(), br, ctx->hNewPkt);
+                    }
+                } else {
+                    DWORD err = GetLastError();
+                    logErr("WinUSB Overlapped Error: %lu", err);
+                    if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_OPERATION_ABORTED) break;
                 }
-                if (first) { LogFirstPkt("WinUSB", buf.data(), mbr); first = false; }
-                PushPacket(buf.data(), mbr, ctx->hNewPkt);
+                pending = false; // Запрос завершился (с ошибкой или без), сбрасываем флаг
+            } else {
+                logErr("WaitForSingleObject error: %lu", GetLastError());
+                break;
             }
         }
         CloseHandle(wEvent);
-        logLine("ReadThread [WinUSB] done");
+        logLine("ReadThread[WinUSB] exited loop");
         ctx->disconnected = true; SetEvent(ctx->hNewPkt);
         return 0;
     }
 
     // ── HID режим ────────────────────────────────────────────────
-    std::vector<BYTE> buf(max(ctx->pktSize, (DWORD)128), 0);
-
-    // [A] GetFeature / [B] GetInputReport...
-    // (Их опускаем для сокращения или оставляем логику GetFeature, если она нужна)
-    // Переходим сразу к безопасному асинхронному ReadFile (Рекомендации #1(КРИТ), #2, #4)
-    
     logLine("METHOD: ReadFile Overlapped (Primary Fallback)");
     HANDLE hf = OpenOv(ctx->devPath);
     if (hf != INVALID_HANDLE_VALUE) {
@@ -536,7 +537,6 @@ DWORD WINAPI ReadThread(LPVOID param) {
         std::vector<BYTE> mb(ctx->pktSize, 0);
         bool first = true;
         
-        // Исправление багов с OVERLAPPED (#1 КРИТИЧЕСКИЙ)
         OVERLAPPED mov = {};
         mov.hEvent = hem;
         bool pendingRead = false;
@@ -566,10 +566,10 @@ DWORD WINAPI ReadThread(LPVOID param) {
             if (mwt == WAIT_TIMEOUT) {
                 if (ctx->stop) {
                     CancelIo(hf);
-                    DWORD tmp = 0; GetOverlappedResult(hf, &mov, &tmp, TRUE); // Ждем отмены (Исправление #4)
+                    DWORD tmp = 0; GetOverlappedResult(hf, &mov, &tmp, TRUE); 
                     break;
                 }
-                continue; // Ждём дальше
+                continue; 
             }
             if (mwt != WAIT_OBJECT_0) break;
 
@@ -589,8 +589,8 @@ DWORD WINAPI ReadThread(LPVOID param) {
         CloseHandle(hf);
     }
 
-    logLine("ReadThread [HID] done");
-    ctx->disconnected = true; SetEvent(ctx->hNewPkt); // Будим главный цикл (Исправление #3)
+    logLine("ReadThread [HID] exited loop");
+    ctx->disconnected = true; SetEvent(ctx->hNewPkt); 
     return 0;
 }
 
@@ -604,7 +604,6 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
         int v=inv?(128-(int)b):((int)b-128);v*=256;
         if(v>32767)v=32767;if(v<-32768)v=-32768;return (SHORT)v;};
 
-    // Заполни маппинг по необходимости
     (void)toAxis;
     return r;
 }
@@ -642,7 +641,6 @@ int main() {
     bool snifOn=false;
     DWORD pkts=0;
 
-    // Рекомендация #3: Цикл переподключения
     while (globalRunning) {
         WorkMode mode = MODE_UNKNOWN;
         DWORD rSz = 64;
@@ -656,7 +654,9 @@ int main() {
         char winusbPath[512] = {};
         if (FindWinUSBPath(winusbPath, sizeof(winusbPath))) {
             if (gUsb.Open(winusbPath)) {
-                gUsb.AggressiveWakeUp(); // Активируем геймпад (Рекомендация #1)
+                gUsb.AggressiveWakeUp(); 
+                Sleep(500); // Даем контроллеру полсекунды на реакцию после WakeUp (рекомендация)
+                
                 rSz = gUsb.maxPkt;
                 rtCtx.pUsb = &gUsb;
                 rtCtx.mode = MODE_WINUSB;
@@ -676,7 +676,6 @@ int main() {
                 rtCtx.mode = MODE_HID;
                 logLine("HID mode detected");
 
-                // Рекомендация #6: Инструкция в UI
                 if (!isGamepad) {
                     uiMsg("Установите WinUSB драйвер через Zadig. См. sniffer.log", CC_RED);
                     logLine("!!! ACTION REQUIRED !!! Device is in raw mode (Usage=0). Install WinUSB via Zadig.");
@@ -747,7 +746,7 @@ int main() {
         uiStatus(true, false, false, MODE_UNKNOWN, pkts);
         if (globalRunning) {
             uiClearMsg();
-            uiMsg("Device lost. Reconnecting...", CC_RED);
+            uiMsg("Device lost or thread exited. Reconnecting...", CC_RED);
             logLine("Connection dropped. Restarting discovery...");
             Sleep(1000);
         }
