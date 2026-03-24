@@ -1,10 +1,11 @@
-name: Build
+name: Build nacon_bridge
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,31 +15,66 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSVC (x64)
+      # ── ViGEm Client SDK ─────────────────────────────────────────
+      # Скачиваем заголовки и .lib из официального NuGet пакета
+      - name: Install ViGEm Client SDK (NuGet)
+        run: |
+          nuget install ViGEmClient -Version 1.22.0.0 -OutputDirectory deps_nuget
+          $pkg = Get-ChildItem -Path deps_nuget -Filter "ViGEmClient.*" -Directory | Select-Object -First 1
+          Write-Host "Found: $($pkg.FullName)"
+
+          # Создаём нужную структуру папок
+          New-Item -ItemType Directory -Force -Path "deps\ViGEmClient\include\ViGEm"
+          New-Item -ItemType Directory -Force -Path "deps\ViGEmClient\lib\Release\x64"
+
+          # Копируем заголовки
+          Copy-Item "$($pkg.FullName)\include\ViGEm\*" `
+                    "deps\ViGEmClient\include\ViGEm\" -Recurse
+
+          # Копируем .lib (x64 Release)
+          Copy-Item "$($pkg.FullName)\lib\release\x64\ViGEmClient.lib" `
+                    "deps\ViGEmClient\lib\Release\x64\ViGEmClient.lib"
+
+          Write-Host "ViGEm SDK ready"
+        shell: pwsh
+
+      # ── Настройка MSVC через Developer Command Prompt ────────────
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Clone ViGEmClient SDK
-        run: git clone --depth=1 https://github.com/nefarius/ViGEmClient.git vigem
-        shell: cmd
-
-      - name: Build ViGEmClient.lib
+      # ── CMake configure ──────────────────────────────────────────
+      - name: CMake Configure
         run: |
-          cl.exe /c /O2 /EHsc /W0 /I vigem\include vigem\src\ViGEmClient.cpp /Fo:ViGEmClient.obj
-          lib.exe /OUT:ViGEmClient.lib ViGEmClient.obj
-        shell: cmd
+          cmake -B build -S . `
+            -G "NMake Makefiles" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVIGEM_INCLUDE_DIR="${{ github.workspace }}/deps/ViGEmClient/include" `
+            -DVIGEM_LIB_DIR="${{ github.workspace }}/deps/ViGEmClient/lib/Release/x64"
+        shell: pwsh
 
-      - name: Compile nacon_bridge.exe
-        run: >
-          cl.exe /O2 /EHsc /W3 main.cpp
-          /I vigem\include
-          user32.lib shell32.lib hid.lib setupapi.lib ViGEmClient.lib
-          /link /OUT:nacon_bridge.exe
-        shell: cmd
+      # ── CMake build ───────────────────────────────────────────────
+      - name: CMake Build
+        run: cmake --build build --config Release
+        shell: pwsh
 
+      # ── Проверяем что .exe создан ─────────────────────────────────
+      - name: Verify output
+        run: |
+          if (Test-Path "build\nacon_bridge.exe") {
+            Write-Host "BUILD SUCCESS: nacon_bridge.exe"
+            Get-Item "build\nacon_bridge.exe" | Select-Object Name, Length
+          } else {
+            Write-Error "BUILD FAILED: nacon_bridge.exe not found"
+            exit 1
+          }
+        shell: pwsh
+
+      # ── Upload artifact ───────────────────────────────────────────
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: nacon_bridge
-          path: nacon_bridge.exe
+          name: nacon-bridge-exe
+          path: build/nacon_bridge.exe
+          retention-days: 30
