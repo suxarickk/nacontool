@@ -2,8 +2,7 @@
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <setupapi.h>
-#include <winusb.h>
-#include <usb100.h>
+#include <bluetoothapis.h>
 #include <ViGEm/Client.h>
 #include <vector>
 #include <cstdio>
@@ -11,11 +10,10 @@
 #include <cstdarg>
 #include <atomic>
 #include <initguid.h>
-#include <usbiodef.h>
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "winusb.lib")
+#pragma comment(lib, "Bthprops.lib") // Библиотека для работы с Bluetooth
 
 // ─── Device config ────────────────────────────────────────────────
 #define NACON_VID 0x3285
@@ -31,10 +29,6 @@ constexpr int   BAR_LEN      = 5;
 constexpr DWORD MAX_HID_REQ  = 4096;
 constexpr DWORD PKT_MAX      = 256;
 
-DEFINE_GUID(GUID_WINUSB_NACON,
-    0xdee824ef, 0x729b, 0x4a0e,
-    0x9c, 0x14, 0xb7, 0x11, 0x7d, 0x33, 0xa8, 0x17);
-
 enum CC : WORD {
     CC_BLK=0, CC_DGRN=2, CC_DGRY=8, CC_GRN=10,
     CC_CYN=11, CC_RED=12, CC_YEL=14, CC_WHT=15, CC_GRY=7
@@ -42,8 +36,7 @@ enum CC : WORD {
 
 enum WorkMode {
     MODE_UNKNOWN  = 0,
-    MODE_HID      = 1,
-    MODE_WINUSB   = 2,
+    MODE_HID      = 1
 };
 
 static HANDLE hCon   = INVALID_HANDLE_VALUE;
@@ -90,7 +83,7 @@ void uiInit(){
     CONSOLE_CURSOR_INFO ci={1,FALSE};SetConsoleCursorInfo(hCon,&ci);
     COORD sz={(SHORT)UI_W,(SHORT)UI_H};SetConsoleScreenBufferSize(hCon,sz);
     SMALL_RECT wr={0,0,(SHORT)(UI_W-1),(SHORT)(UI_H-1)};SetConsoleWindowInfo(hCon,TRUE,&wr);
-    SetConsoleTitleA("Nacon MG-X -> Xbox 360 Bridge");
+    SetConsoleTitleA("Nacon MG-X -> Xbox 360 Bridge (Bluetooth)");
     DWORD w;COORD o={0,0};
     FillConsoleOutputCharacterA(hCon,' ',UI_W*UI_H,o,&w);
     FillConsoleOutputAttribute(hCon,CC_GRY,UI_W*UI_H,o,&w);
@@ -112,10 +105,10 @@ void uiFrame(){
     cPr(0,6,"  DPAD:",CC_DGRY);cPr(24,6,"L-STICK:",CC_DGRY);cPr(46,6,"R-STICK:",CC_DGRY);
     cPr(0,7,SEP,CC_DGRY);
     cPr(0,8,"  FACE:",CC_DGRY);cPr(42,8,"THUMBS:",CC_DGRY);
-    cPr(0,9,SEP,CC_DGRY);cPr(0,10,"  RAW USB:",CC_DGRY);
-    cPr(0,14,SEP,CC_DGRY);cPr(0,15,"  SNIFER",CC_DGRY);
+    cPr(0,9,SEP,CC_DGRY);cPr(0,10,"  RAW DATA:",CC_DGRY); // Изменили RAW USB на RAW DATA
+    cPr(0,14,SEP,CC_DGRY);cPr(0,15,"  SNIFFER",CC_DGRY);
     cPr(0,21,SEP,CC_DGRY);
-    cPr(1,22,"[S]",CC_YEL);cPr(4,22," snifer on/off",CC_DGRY);
+    cPr(1,22,"[S]",CC_YEL);cPr(4,22," sniffer on/off",CC_DGRY);
     cPr(20,22,"[ESC]",CC_YEL);cPr(25,22," exit",CC_DGRY);
     cPr(38,22,"log->",CC_DGRY);cPr(43,22,"sniffer.log",CC_YEL);
 }
@@ -134,8 +127,7 @@ void uiStatus(bool vig,bool nac,bool xbx,WorkMode mode,DWORD pkts){
     cPr(40,2, xbx?"[ON] ":"[--] ",xbx?CC_GRN:CC_RED);
     const char* ms; CC mc;
     switch(mode){
-        case MODE_WINUSB: ms="[USB] "; mc=CC_CYN; break;
-        case MODE_HID:    ms="[HID] "; mc=CC_GRN; break;
+        case MODE_HID:    ms="[BT ] "; mc=CC_GRN; break;
         default:          ms="[---] "; mc=CC_DGRY; break;
     }
     cPr(55,2,ms,mc);
@@ -209,180 +201,67 @@ struct HG{
 };
 
 // ─────────────────────────────────────────────────────────────────
-//  WinUSBDevice
+//  Bluetooth Force Connect
 // ─────────────────────────────────────────────────────────────────
-struct WinUSBDevice {
-    HANDLE          hFile     = INVALID_HANDLE_VALUE;
-    WINUSB_INTERFACE_HANDLE hUsb = nullptr;
-    UCHAR           epIn      = 0;
-    ULONG           maxPkt    = 64; 
-    bool            ready     = false;
+void ForceConnectBluetoothHID() {
+    logLine("--- Bluetooth Check ---");
+    
+    BLUETOOTH_DEVICE_SEARCH_PARAMS search = {};
+    search.dwSize = sizeof(search);
+    search.fReturnAuthenticated = TRUE;  // Только сопряжённые
+    search.fReturnRemembered = TRUE;     // Запомненные системой
+    search.cTimeoutMultiplier = 2;       // Таймаут
 
-    bool Open(const char* path) {
-        hFile = CreateFileA(path,
-                            GENERIC_READ | GENERIC_WRITE,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            NULL, OPEN_EXISTING,
-                            FILE_FLAG_OVERLAPPED, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            logErr("WinUSB CreateFile failed: %lu", GetLastError());
-            return false;
-        }
+    BLUETOOTH_DEVICE_INFO info = {};
+    info.dwSize = sizeof(info);
 
-        if (!WinUsb_Initialize(hFile, &hUsb)) {
-            logErr("WinUsb_Initialize failed: %lu", GetLastError());
-            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
-            return false;
-        }
+    HANDLE hFind = BluetoothFindFirstDevice(&search, &info);
+    if (!hFind) {
+        logLine("BluetoothFindFirstDevice failed, error: %lu", GetLastError());
+        return;
+    }
 
-        logLine("WinUSB initialized OK. Enumerating all interfaces...");
+    bool found = false;
+    do {
+        // szName — это WCHAR, используем wcsstr для поиска
+        if (wcsstr(info.szName, L"MG-X") || wcsstr(info.szName, L"Nacon") || wcsstr(info.szName, L"NACON")) {
+            found = true;
+            logLine("Found BT Device: %S[%02X:%02X:%02X:%02X:%02X:%02X]", 
+                info.szName, 
+                info.Address.rgBytes[5], info.Address.rgBytes[4], info.Address.rgBytes[3], 
+                info.Address.rgBytes[2], info.Address.rgBytes[1], info.Address.rgBytes[0]);
 
-        bool foundIn = false;
-        
-        // 1. Сканируем основной интерфейс (и его альт. сеттинги)
-        UCHAR altIdx = 0;
-        USB_INTERFACE_DESCRIPTOR ifDesc = {};
-        while (WinUsb_QueryInterfaceSettings(hUsb, altIdx, &ifDesc)) {
-            logLine("Interface 0 (Alt %u): Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
-                    altIdx, ifDesc.bInterfaceClass, ifDesc.bInterfaceSubClass, 
-                    ifDesc.bInterfaceProtocol, ifDesc.bNumEndpoints);
+            // Стандартный GUID для HID over Bluetooth
+            GUID hidService = { 0x00001124, 0x0000, 0x1000, {0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb} };
 
-            for (UCHAR ep = 0; ep < ifDesc.bNumEndpoints; ep++) {
-                WINUSB_PIPE_INFORMATION pipe = {};
-                if (!WinUsb_QueryPipe(hUsb, altIdx, ep, &pipe)) continue;
-                
-                logLine("  Pipe[%u]: ID=%02X Type=%u MaxPkt=%u", ep, pipe.PipeId, pipe.PipeType, pipe.MaximumPacketSize);
+            // Принудительно отключаем службу (если "зависла")
+            logLine("Disabling HID service to reset state...");
+            DWORD res = BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_DISABLE);
+            Sleep(500);
 
-                if (altIdx == 0 && pipe.PipeType == UsbdPipeTypeInterrupt && (pipe.PipeId & 0x80) != 0 && !foundIn) {
-                    epIn    = pipe.PipeId;
-                    maxPkt  = pipe.MaximumPacketSize; 
-                    foundIn = true;
-                    logLine("  ^-- Selected as Primary Interrupt IN");
-                }
+            // Включаем её обратно
+            logLine("Enabling HID service...");
+            res = BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_ENABLE);
+            if (res == ERROR_SUCCESS) {
+                logLine("HID service enabled successfully for %S", info.szName);
+                uiMsg("Bluetooth HID service activated!", CC_GRN);
+            } else {
+                logErr("BluetoothSetServiceState enable failed: %lu", res);
             }
-            altIdx++;
+            break; // Нашли первое подходящее устройство, прерываем поиск
         }
+    } while (BluetoothFindNextDevice(hFind, &info));
+    BluetoothFindDeviceClose(hFind);
 
-        // 2. Ищем ассоциированные интерфейсы (для iAP2 Class 0xFF)
-        UCHAR assocIdx = 0;
-        WINUSB_INTERFACE_HANDLE hAssoc = nullptr;
-        while (WinUsb_GetAssociatedInterface(hUsb, assocIdx, &hAssoc)) {
-            USB_INTERFACE_DESCRIPTOR assocDesc = {};
-            if (WinUsb_QueryInterfaceSettings(hAssoc, 0, &assocDesc)) {
-                logLine("Assoc Interface %u: Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
-                        assocIdx + 1, assocDesc.bInterfaceClass, assocDesc.bInterfaceSubClass,
-                        assocDesc.bInterfaceProtocol, assocDesc.bNumEndpoints);
-                for (UCHAR ep = 0; ep < assocDesc.bNumEndpoints; ep++) {
-                    WINUSB_PIPE_INFORMATION pipe = {};
-                    if (WinUsb_QueryPipe(hAssoc, 0, ep, &pipe)) {
-                        logLine("  AssocPipe[%u]: ID=%02X Type=%u MaxPkt=%u", ep, pipe.PipeId, pipe.PipeType, pipe.MaximumPacketSize);
-                    }
-                }
-            }
-            WinUsb_Free(hAssoc);
-            assocIdx++;
-        }
-
-        if (!foundIn) {
-            epIn   = 0x81;
-            maxPkt = 64; 
-            logLine("Falling back to default endpoint 0x81, MaxPkt 64");
-        }
-
-        ULONG rawIo = 0; 
-        WinUsb_SetPipePolicy(hUsb, epIn, RAW_IO, sizeof(rawIo), &rawIo);
-        
-        ULONG timeout = 1000;
-        WinUsb_SetPipePolicy(hUsb, epIn, PIPE_TRANSFER_TIMEOUT, sizeof(timeout), &timeout);
-
-        ready = true;
-        return true;
+    if (!found) {
+        logLine("No matching Bluetooth device found.");
+        uiMsg("Bluetooth device not found. Ensure it's paired.", CC_RED);
     }
-
-    bool SendControlRequest(UCHAR bmRequestType, UCHAR bRequest, USHORT wValue, USHORT wIndex, UCHAR* data, USHORT dataLength) {
-        if (!hUsb || !ready) return false;
-        WINUSB_SETUP_PACKET setup = {};
-        setup.RequestType = bmRequestType;
-        setup.Request = bRequest;
-        setup.Value = wValue;
-        setup.Index = wIndex;
-        setup.Length = dataLength;
-        ULONG transferred = 0;
-        BOOL ok = WinUsb_ControlTransfer(hUsb, setup, data, dataLength, &transferred, NULL);
-        if(!ok) logErr("ControlTransfer failed. req:%02X val:%04X err:%lu", bRequest, wValue, GetLastError());
-        return ok == TRUE;
-    }
-
-    void AggressiveWakeUp() {
-        logLine("Sending Output Report 0x00 (65 bytes)...");
-        BYTE buf[65] = {0};
-        
-        // bmRequestType = 0x21 (Host to Device, Class)
-        // bRequest = 0x09 (Set_Report)
-        // wValue = 0x0200 (Type: Output 0x02, Report ID: 0x00)
-        SendControlRequest(0x21, 0x09, 0x0200, 0, buf, 65);
-
-        logLine("Testing GET_REPORT (Feature 0x00)...");
-        BYTE getBuf[65] = {0};
-        // bmRequestType = 0xA1 (Device to Host, Class)
-        // bRequest = 0x01 (Get_Report)
-        // wValue = 0x0300 (Type: Feature 0x03, Report ID: 0x00)
-        WINUSB_SETUP_PACKET setup = {0xA1, 0x01, 0x0300, 0, 65};
-        ULONG transferred = 0;
-        if (WinUsb_ControlTransfer(hUsb, setup, getBuf, 65, &transferred, NULL)) {
-            logLine("GET_REPORT success! Transferred: %lu bytes", transferred);
-            char hex[256] = {0};
-            for(int i=0; i<min(16, (int)transferred); i++) sprintf_s(hex + strlen(hex), 256 - strlen(hex), "%02X ", getBuf[i]);
-            logLine("Data: %s", hex);
-        } else {
-            logErr("GET_REPORT failed. err:%lu", GetLastError());
-        }
-
-        logLine("WakeUp sequence finished.");
-    }
-
-    void Close() {
-        if (hUsb) { WinUsb_Free(hUsb); hUsb = nullptr; }
-        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
-        ready = false;
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────
-//  Поиск Устройств
-// ─────────────────────────────────────────────────────────────────
-bool FindWinUSBPath(char* outPath, size_t pathMax) {
-    const GUID* guids[] = { &GUID_WINUSB_NACON, &GUID_DEVINTERFACE_USB_DEVICE };
-    for (int g = 0; g < 2; g++) {
-        HDEVINFO hdi = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-        if (hdi == INVALID_HANDLE_VALUE) continue;
-
-        SP_DEVICE_INTERFACE_DATA did = {}; did.cbSize = sizeof(did);
-        for (int i = 0; SetupDiEnumDeviceInterfaces(hdi, NULL, guids[g], i, &did); i++) {
-            DWORD req = 0;
-            SetupDiGetDeviceInterfaceDetail(hdi, &did, NULL, 0, &req, NULL);
-            if (req == 0 || req > MAX_HID_REQ) continue;
-
-            std::vector<BYTE> buf(req);
-            auto* det = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
-            det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-            if (!SetupDiGetDeviceInterfaceDetail(hdi, &did, det, req, NULL, NULL)) continue;
-
-            char lower[512] = {};
-            strncpy_s(lower, sizeof(lower), det->DevicePath, sizeof(lower) - 1);
-            _strlwr_s(lower, sizeof(lower));
-
-            if (strstr(lower, "vid_3285") && strstr(lower, "pid_0644")) {
-                strncpy_s(outPath, pathMax, det->DevicePath, pathMax - 1);
-                SetupDiDestroyDeviceInfoList(hdi);
-                return true;
-            }
-        }
-        SetupDiDestroyDeviceInfoList(hdi);
-    }
-    return false;
 }
 
+// ─────────────────────────────────────────────────────────────────
+//  Поиск Устройств (HID)
+// ─────────────────────────────────────────────────────────────────
 bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad) {
     GUID hidGuid; HidD_GetHidGuid(&hidGuid);
     HDEVINFO hdi = SetupDiGetClassDevs(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -411,6 +290,11 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
         HIDD_ATTRIBUTES attr = { sizeof(attr) };
         if (!HidD_GetAttributes(ht, &attr)) { CloseHandle(ht); continue; }
 
+        wchar_t wn[128]={}; char name[128]="(unknown)";
+        if (HidD_GetProductString(ht, wn, sizeof(wn))) {
+            WideCharToMultiByte(CP_ACP, 0, wn, -1, name, sizeof(name), NULL, NULL);
+        }
+
         WORD up=0, use=0; DWORD inLen=0;
         PHIDP_PREPARSED_DATA ppd = nullptr;
         if (HidD_GetPreparsedData(ht, &ppd)) {
@@ -421,10 +305,25 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
             HidD_FreePreparsedData(ppd);
         }
 
-        bool isN  = (attr.VendorID == NACON_VID && attr.ProductID == NACON_PID);
+        // 1. Проверяем по USB VID/PID (если вдруг)
+        bool isN = (attr.VendorID == NACON_VID && attr.ProductID == NACON_PID);
+
+        // 2. Расширенный поиск по имени (для Bluetooth устройств)
+        char lowerName[256];
+        strncpy_s(lowerName, sizeof(lowerName), name, _TRUNCATE);
+        _strlwr_s(lowerName);
+
+        if (!isN && (strstr(lowerName, "mg-x") != nullptr || strstr(lowerName, "nacon") != nullptr)) {
+            isN = true;
+            logLine("  ^-- Identified as Nacon by Name (Bluetooth Fallback)");
+        }
+
         bool isGP = (up == 0x01 && (use == 0x04 || use == 0x05));
 
-        if (isN) logLine("  Found NACON: VID=%04X PID=%04X Page=%02X Use=%02X InLen=%u", attr.VendorID, attr.ProductID, up, use, inLen);
+        if (isN) {
+            logLine("  Found NACON: Name=\"%s\" VID=%04X PID=%04X Page=%02X Use=%02X InLen=%u", 
+                    name, attr.VendorID, attr.ProductID, up, use, inLen);
+        }
 
         if (isN && isGP && !f1) { p1[0]='\0'; strncpy_s(p1, sizeof(p1), det->DevicePath, sizeof(p1)-1); s1=inLen; f1=true; gp1=true; }
         if (isN && !isGP && !f3) { p3[0]='\0'; strncpy_s(p3, sizeof(p3), det->DevicePath, sizeof(p3)-1); s3=inLen; f3=true; gp3=false; }
@@ -434,6 +333,7 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
     SetupDiDestroyDeviceInfoList(hdi);
     logLine("=== SCAN END ===");
 
+    // Правильный приоритет (сначала Nacon Gamepad, затем Nacon Raw)
     if (f1) { strncpy_s(outPath, pathMax, p1, pathMax-1); if(outSize)*outSize=s1; if(isGamepad)*isGamepad=gp1; return true; }
     if (f3) { strncpy_s(outPath, pathMax, p3, pathMax-1); if(outSize)*outSize=s3; if(isGamepad)*isGamepad=gp3; return true; }
     return false;
@@ -446,7 +346,6 @@ struct ReadCtx {
     HANDLE            hDev     = INVALID_HANDLE_VALUE;
     char              devPath[512] = {};
     DWORD             pktSize  = 64;
-    WinUSBDevice*     pUsb     = nullptr;
     WorkMode          mode     = MODE_UNKNOWN;
     HANDLE            hNewPkt  = INVALID_HANDLE_VALUE;
     
@@ -467,109 +366,26 @@ static void LogFirstPkt(const char* m, const BYTE* d, DWORD sz) {
     for (DWORD j=0; j<sz && j<48 && pos<490; j++) {
         int n=snprintf(raw+pos,sizeof(raw)-pos,"%02X ",d[j]); if(n>0)pos+=n;
     }
-    logLine("FIRST_PKT [%s] size=%lu  RAW: %s", m, sz, raw);
+    logLine("FIRST_PKT[%s] size=%lu  RAW: %s", m, sz, raw);
 }
 
 static HANDLE OpenOv(const char* path) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-    if (h == INVALID_HANDLE_VALUE)
+    if (h == INVALID_HANDLE_VALUE) {
         h = CreateFileA(path, GENERIC_READ|GENERIC_WRITE,
                         FILE_SHARE_READ|FILE_SHARE_WRITE,
                         NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    }
     return h;
 }
 
 DWORD WINAPI ReadThread(LPVOID param) {
     ReadCtx* ctx = reinterpret_cast<ReadCtx*>(param);
-    logLine("ReadThread started  mode=%s  pktSize=%lu", ctx->mode == MODE_WINUSB ? "WINUSB" : "HID", ctx->pktSize);
+    logLine("ReadThread started  mode=HID  pktSize=%lu", ctx->pktSize);
 
-    // ── WinUSB режим (Исправленный с защитой от порчи Overlapped) ──
-    if (ctx->mode == MODE_WINUSB && ctx->pUsb) {
-        logLine("METHOD: WinUSB Interrupt Read (Fixed Timeout Logic)");
-        
-        DWORD readSize = ctx->pUsb->maxPkt; 
-        std::vector<BYTE> buf(readSize, 0);
-        
-        HANDLE wEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        OVERLAPPED wov = {};
-        wov.hEvent = wEvent;
-        bool first = true;
-        bool pending = false;
-        DWORD timeoutsCount = 0;
-
-        while (!ctx->stop) {
-            if (!pending) {
-                ResetEvent(wEvent);
-                DWORD br0 = 0;
-                BOOL ok = WinUsb_ReadPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn, buf.data(), readSize, &br0, &wov);
-                DWORD err = GetLastError();
-
-                if (ok) { 
-                    if (br0 > 0) {
-                        if (first) { LogFirstPkt("WinUSB", buf.data(), br0); first = false; }
-                        PushPacket(buf.data(), br0, ctx->hNewPkt);
-                        timeoutsCount = 0;
-                    }
-                    continue; 
-                }
-
-                if (err != ERROR_IO_PENDING) {
-                    logErr("WinUsb_ReadPipe fatal error: %lu", err);
-                    break;
-                }
-                pending = true; 
-            }
-
-            DWORD wait = WaitForSingleObject(wEvent, 1000);
-            
-            if (wait == WAIT_TIMEOUT) {
-                if (ctx->stop) { 
-                    WinUsb_AbortPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn);
-                    DWORD tmp = 0; GetOverlappedResult(ctx->pUsb->hFile, &wov, &tmp, TRUE);
-                    break;
-                }
-                continue; 
-            }
-            
-            if (wait == WAIT_OBJECT_0) {
-                DWORD br = 0;
-                if (GetOverlappedResult(ctx->pUsb->hFile, &wov, &br, FALSE)) {
-                    if (br > 0) {
-                        if (first) { LogFirstPkt("WinUSB", buf.data(), br); first = false; }
-                        PushPacket(buf.data(), br, ctx->hNewPkt);
-                        timeoutsCount = 0;
-                    }
-                } else {
-                    DWORD err = GetLastError();
-                    if (err == ERROR_SEM_TIMEOUT) {
-                        // Нормальный таймаут от драйвера (нет данных)
-                        timeoutsCount++;
-                        if (timeoutsCount % 5 == 0) {
-                            logLine("WinUSB: waiting for data... (%lu timeouts)", timeoutsCount);
-                        }
-                    } else {
-                        logErr("WinUSB Overlapped Error: %lu", err);
-                        if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_OPERATION_ABORTED) {
-                            logLine("WinUSB: Device disconnected or aborted.");
-                            break;
-                        }
-                    }
-                }
-                pending = false; 
-            } else {
-                logErr("WaitForSingleObject error: %lu", GetLastError());
-                break;
-            }
-        }
-        CloseHandle(wEvent);
-        logLine("ReadThread[WinUSB] exited loop. Reason: %s", ctx->stop ? "Stopped by user" : "Fatal Error / Disconnect");
-        ctx->disconnected = true; SetEvent(ctx->hNewPkt);
-        return 0;
-    }
-
-    // ── HID режим ────────────────────────────────────────────────
-    logLine("METHOD: ReadFile Overlapped (Primary Fallback)");
+    // ── HID режим (Абсолютно безопасный Overlapped I/O) ────────────
+    logLine("METHOD: ReadFile Overlapped");
     HANDLE hf = OpenOv(ctx->devPath);
     if (hf != INVALID_HANDLE_VALUE) {
         HANDLE hem = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -643,6 +459,7 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
         int v=inv?(128-(int)b):((int)b-128);v*=256;
         if(v>32767)v=32767;if(v<-32768)v=-32768;return (SHORT)v;};
 
+    // Заполни маппинг по необходимости
     (void)toAxis;
     return r;
 }
@@ -650,7 +467,6 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
 inline bool keyDown(int vk){ return (GetAsyncKeyState(vk)&0x8000)!=0; }
 
 static ReadCtx rtCtx;
-static WinUSBDevice gUsb;
 
 int main() {
     logOpen();
@@ -680,50 +496,37 @@ int main() {
     bool snifOn=false;
     DWORD pkts=0;
 
+    // Цикл переподключения
     while (globalRunning) {
         WorkMode mode = MODE_UNKNOWN;
         DWORD rSz = 64;
         bool isGamepad = false;
 
         uiClearMsg();
-        uiMsg("Scanning for Nacon MG-X...", CC_YEL);
+        
+        // 1. Форсированно будим устройство через Bluetooth-службу
+        ForceConnectBluetoothHID();
+        Sleep(1500); // Даём Windows время поднять HID-драйверы для устройства
+        
+        // 2. Ищем HID интерфейсы
+        uiMsg("Scanning for Nacon MG-X (HID)...", CC_YEL);
         logLine("--- Starting Discovery ---");
 
-        // Пытаемся WinUSB
-        char winusbPath[512] = {};
-        if (FindWinUSBPath(winusbPath, sizeof(winusbPath))) {
-            if (gUsb.Open(winusbPath)) {
-                gUsb.AggressiveWakeUp(); 
-                Sleep(500); 
-                
-                rSz = gUsb.maxPkt;
-                rtCtx.pUsb = &gUsb;
-                rtCtx.mode = MODE_WINUSB;
-                mode = MODE_WINUSB;
-                logLine("*** Running in WinUSB mode ***");
-                uiMsg("WinUSB mode: reading direct endpoint!", CC_GRN);
+        char hidPath[512] = {};
+        if (FindHIDPath(hidPath, sizeof(hidPath), &rSz, &isGamepad)) {
+            strncpy_s(rtCtx.devPath, sizeof(rtCtx.devPath), hidPath, sizeof(hidPath)-1);
+            mode = MODE_HID;
+            rtCtx.mode = MODE_HID;
+            logLine("HID mode detected");
+
+            if (!isGamepad) {
+                uiMsg("Warning: Device does not report standard gamepad usage.", CC_YEL);
+            } else {
+                uiMsg("Bluetooth HID Connected Successfully", CC_GRN);
             }
         }
 
-        // Если не WinUSB - пытаемся HID
-        HG hNacon;
-        if (mode == MODE_UNKNOWN) {
-            char hidPath[512] = {};
-            if (FindHIDPath(hidPath, sizeof(hidPath), &rSz, &isGamepad)) {
-                strncpy_s(rtCtx.devPath, sizeof(rtCtx.devPath), hidPath, sizeof(hidPath)-1);
-                mode = MODE_HID;
-                rtCtx.mode = MODE_HID;
-                logLine("HID mode detected");
-
-                if (!isGamepad) {
-                    uiMsg("Установите WinUSB драйвер через Zadig. См. sniffer.log", CC_RED);
-                    logLine("!!! ACTION REQUIRED !!! Device is in raw mode (Usage=0). Install WinUSB via Zadig.");
-                } else {
-                    uiMsg("HID mode connected", CC_GRN);
-                }
-            }
-        }
-
+        // Если не нашли — ждем и пробуем снова
         if (mode == MODE_UNKNOWN) {
             if (keyDown(VK_ESCAPE)) break;
             Sleep(1500);
@@ -780,7 +583,6 @@ int main() {
         rtCtx.stop = true;
         WaitForSingleObject(hThread, 3000);
         CloseHandle(hThread);
-        if (mode == MODE_WINUSB) gUsb.Close();
 
         uiStatus(true, false, false, MODE_UNKNOWN, pkts);
         if (globalRunning) {
