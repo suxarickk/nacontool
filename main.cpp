@@ -235,41 +235,60 @@ struct WinUSBDevice {
             return false;
         }
 
-        logLine("WinUSB initialized OK");
-
-        USB_INTERFACE_DESCRIPTOR ifDesc = {};
-        if (!WinUsb_QueryInterfaceSettings(hUsb, 0, &ifDesc)) {
-            logErr("WinUsb_QueryInterfaceSettings: %lu", GetLastError());
-            return false;
-        }
-
-        // Выводим данные интерфейса в лог для отладки
-        logLine("Interface 0: Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
-                ifDesc.bInterfaceClass, ifDesc.bInterfaceSubClass, 
-                ifDesc.bInterfaceProtocol, ifDesc.bNumEndpoints);
+        logLine("WinUSB initialized OK. Enumerating all interfaces...");
 
         bool foundIn = false;
-        for (UCHAR ep = 0; ep < ifDesc.bNumEndpoints; ep++) {
-            WINUSB_PIPE_INFORMATION pipe = {};
-            if (!WinUsb_QueryPipe(hUsb, 0, ep, &pipe)) continue;
+        
+        // 1. Сканируем основной интерфейс (и его альт. сеттинги)
+        UCHAR altIdx = 0;
+        USB_INTERFACE_DESCRIPTOR ifDesc = {};
+        while (WinUsb_QueryInterfaceSettings(hUsb, altIdx, &ifDesc)) {
+            logLine("Interface 0 (Alt %u): Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
+                    altIdx, ifDesc.bInterfaceClass, ifDesc.bInterfaceSubClass, 
+                    ifDesc.bInterfaceProtocol, ifDesc.bNumEndpoints);
 
-            if (pipe.PipeType == UsbdPipeTypeInterrupt && (pipe.PipeId & 0x80) != 0 && !foundIn) {
-                epIn    = pipe.PipeId;
-                // БЕРЕМ ТОЧНЫЙ РАЗМЕР из дескриптора без всяких хаков с max()
-                maxPkt  = pipe.MaximumPacketSize; 
-                foundIn = true;
-                logLine("  Selected Interrupt IN: 0x%02X, MaxPkt: %lu", epIn, maxPkt);
+            for (UCHAR ep = 0; ep < ifDesc.bNumEndpoints; ep++) {
+                WINUSB_PIPE_INFORMATION pipe = {};
+                if (!WinUsb_QueryPipe(hUsb, altIdx, ep, &pipe)) continue;
+                
+                logLine("  Pipe[%u]: ID=%02X Type=%u MaxPkt=%u", ep, pipe.PipeId, pipe.PipeType, pipe.MaximumPacketSize);
+
+                if (altIdx == 0 && pipe.PipeType == UsbdPipeTypeInterrupt && (pipe.PipeId & 0x80) != 0 && !foundIn) {
+                    epIn    = pipe.PipeId;
+                    maxPkt  = pipe.MaximumPacketSize; 
+                    foundIn = true;
+                    logLine("  ^-- Selected as Primary Interrupt IN");
+                }
             }
+            altIdx++;
+        }
+
+        // 2. Ищем ассоциированные интерфейсы (для iAP2 Class 0xFF)
+        UCHAR assocIdx = 0;
+        WINUSB_INTERFACE_HANDLE hAssoc = nullptr;
+        while (WinUsb_GetAssociatedInterface(hUsb, assocIdx, &hAssoc)) {
+            USB_INTERFACE_DESCRIPTOR assocDesc = {};
+            if (WinUsb_QueryInterfaceSettings(hAssoc, 0, &assocDesc)) {
+                logLine("Assoc Interface %u: Class=%02X SubClass=%02X Protocol=%02X NumEPs=%u",
+                        assocIdx + 1, assocDesc.bInterfaceClass, assocDesc.bInterfaceSubClass,
+                        assocDesc.bInterfaceProtocol, assocDesc.bNumEndpoints);
+                for (UCHAR ep = 0; ep < assocDesc.bNumEndpoints; ep++) {
+                    WINUSB_PIPE_INFORMATION pipe = {};
+                    if (WinUsb_QueryPipe(hAssoc, 0, ep, &pipe)) {
+                        logLine("  AssocPipe[%u]: ID=%02X Type=%u MaxPkt=%u", ep, pipe.PipeId, pipe.PipeType, pipe.MaximumPacketSize);
+                    }
+                }
+            }
+            WinUsb_Free(hAssoc);
+            assocIdx++;
         }
 
         if (!foundIn) {
             epIn   = 0x81;
-            maxPkt = 64; // Fallback
+            maxPkt = 64; 
             logLine("Falling back to default endpoint 0x81, MaxPkt 64");
         }
 
-        // Отключаем RAW_IO. RAW_IO заставляет WinUSB быть очень строгим к размерам буфера.
-        // Без него драйвер сам склеит/обрежет пакет, что безопаснее для отладки MFi.
         ULONG rawIo = 0; 
         WinUsb_SetPipePolicy(hUsb, epIn, RAW_IO, sizeof(rawIo), &rawIo);
         
@@ -295,20 +314,30 @@ struct WinUSBDevice {
     }
 
     void AggressiveWakeUp() {
-        logLine("Sending Enhanced MFi WakeUp...");
-        BYTE buf[64] = {0};
-
-        // Попытка 1: Стандартный HID-пинок (Output Report ID 0x01)
-        SendControlRequest(0x21, 0x09, 0x0201, 0, buf, 64); 
+        logLine("Sending Output Report 0x00 (65 bytes)...");
+        BYTE buf[65] = {0};
         
-        // Попытка 2: Переключение режима (Force Active)
-        buf[0] = 0x04; buf[1] = 0x00; 
-        SendControlRequest(0x21, 0x09, 0x0302, 0, buf, 64);
+        // bmRequestType = 0x21 (Host to Device, Class)
+        // bRequest = 0x09 (Set_Report)
+        // wValue = 0x0200 (Type: Output 0x02, Report ID: 0x00)
+        SendControlRequest(0x21, 0x09, 0x0200, 0, buf, 65);
 
-        // Попытка 3: Нулевой Feature Report на ID 0x00
-        memset(buf, 0, 64);
-        SendControlRequest(0x21, 0x09, 0x0300, 0, buf, 64);
-        
+        logLine("Testing GET_REPORT (Feature 0x00)...");
+        BYTE getBuf[65] = {0};
+        // bmRequestType = 0xA1 (Device to Host, Class)
+        // bRequest = 0x01 (Get_Report)
+        // wValue = 0x0300 (Type: Feature 0x03, Report ID: 0x00)
+        WINUSB_SETUP_PACKET setup = {0xA1, 0x01, 0x0300, 0, 65};
+        ULONG transferred = 0;
+        if (WinUsb_ControlTransfer(hUsb, setup, getBuf, 65, &transferred, NULL)) {
+            logLine("GET_REPORT success! Transferred: %lu bytes", transferred);
+            char hex[256] = {0};
+            for(int i=0; i<min(16, (int)transferred); i++) sprintf_s(hex + strlen(hex), 256 - strlen(hex), "%02X ", getBuf[i]);
+            logLine("Data: %s", hex);
+        } else {
+            logErr("GET_REPORT failed. err:%lu", GetLastError());
+        }
+
         logLine("WakeUp sequence finished.");
     }
 
@@ -457,9 +486,8 @@ DWORD WINAPI ReadThread(LPVOID param) {
 
     // ── WinUSB режим (Исправленный с защитой от порчи Overlapped) ──
     if (ctx->mode == MODE_WINUSB && ctx->pUsb) {
-        logLine("METHOD: WinUSB Interrupt Read (Fixed)");
+        logLine("METHOD: WinUSB Interrupt Read (Fixed Timeout Logic)");
         
-        // ВАЖНО: Размер буфера строго равен MaxPkt (полученному из дескриптора)
         DWORD readSize = ctx->pUsb->maxPkt; 
         std::vector<BYTE> buf(readSize, 0);
         
@@ -468,9 +496,9 @@ DWORD WINAPI ReadThread(LPVOID param) {
         wov.hEvent = wEvent;
         bool first = true;
         bool pending = false;
+        DWORD timeoutsCount = 0;
 
         while (!ctx->stop) {
-            // Запускаем асинхронное чтение только если нет ожидающего!
             if (!pending) {
                 ResetEvent(wEvent);
                 DWORD br0 = 0;
@@ -478,31 +506,30 @@ DWORD WINAPI ReadThread(LPVOID param) {
                 DWORD err = GetLastError();
 
                 if (ok) { 
-                    // Данные получены моментально
                     if (br0 > 0) {
                         if (first) { LogFirstPkt("WinUSB", buf.data(), br0); first = false; }
                         PushPacket(buf.data(), br0, ctx->hNewPkt);
+                        timeoutsCount = 0;
                     }
-                    continue; // Сразу идем на следующую итерацию
+                    continue; 
                 }
 
                 if (err != ERROR_IO_PENDING) {
                     logErr("WinUsb_ReadPipe fatal error: %lu", err);
                     break;
                 }
-                pending = true; // Запрос отправлен в драйвер, ждем
+                pending = true; 
             }
 
-            // Ждем завершения
             DWORD wait = WaitForSingleObject(wEvent, 1000);
             
             if (wait == WAIT_TIMEOUT) {
-                if (ctx->stop) { // Если попросили остановиться во время таймаута
+                if (ctx->stop) { 
                     WinUsb_AbortPipe(ctx->pUsb->hUsb, ctx->pUsb->epIn);
                     DWORD tmp = 0; GetOverlappedResult(ctx->pUsb->hFile, &wov, &tmp, TRUE);
                     break;
                 }
-                continue; // Важно: pending остается TRUE, на след. итерации мы снова будем только ждать!
+                continue; 
             }
             
             if (wait == WAIT_OBJECT_0) {
@@ -511,20 +538,32 @@ DWORD WINAPI ReadThread(LPVOID param) {
                     if (br > 0) {
                         if (first) { LogFirstPkt("WinUSB", buf.data(), br); first = false; }
                         PushPacket(buf.data(), br, ctx->hNewPkt);
+                        timeoutsCount = 0;
                     }
                 } else {
                     DWORD err = GetLastError();
-                    logErr("WinUSB Overlapped Error: %lu", err);
-                    if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_OPERATION_ABORTED) break;
+                    if (err == ERROR_SEM_TIMEOUT) {
+                        // Нормальный таймаут от драйвера (нет данных)
+                        timeoutsCount++;
+                        if (timeoutsCount % 5 == 0) {
+                            logLine("WinUSB: waiting for data... (%lu timeouts)", timeoutsCount);
+                        }
+                    } else {
+                        logErr("WinUSB Overlapped Error: %lu", err);
+                        if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_OPERATION_ABORTED) {
+                            logLine("WinUSB: Device disconnected or aborted.");
+                            break;
+                        }
+                    }
                 }
-                pending = false; // Запрос завершился (с ошибкой или без), сбрасываем флаг
+                pending = false; 
             } else {
                 logErr("WaitForSingleObject error: %lu", GetLastError());
                 break;
             }
         }
         CloseHandle(wEvent);
-        logLine("ReadThread[WinUSB] exited loop");
+        logLine("ReadThread[WinUSB] exited loop. Reason: %s", ctx->stop ? "Stopped by user" : "Fatal Error / Disconnect");
         ctx->disconnected = true; SetEvent(ctx->hNewPkt);
         return 0;
     }
@@ -655,7 +694,7 @@ int main() {
         if (FindWinUSBPath(winusbPath, sizeof(winusbPath))) {
             if (gUsb.Open(winusbPath)) {
                 gUsb.AggressiveWakeUp(); 
-                Sleep(500); // Даем контроллеру полсекунды на реакцию после WakeUp (рекомендация)
+                Sleep(500); 
                 
                 rSz = gUsb.maxPkt;
                 rtCtx.pUsb = &gUsb;
