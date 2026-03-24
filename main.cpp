@@ -9,7 +9,6 @@
 #include <cstring>
 #include <cstdarg>
 #include <atomic>
-#include <initguid.h>
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -42,6 +41,9 @@ enum WorkMode {
 static HANDLE hCon   = INVALID_HANDLE_VALUE;
 static HANDLE hConIn = INVALID_HANDLE_VALUE;
 static FILE*  gLog   = nullptr;
+
+static char g_MgxMac[32] = {0}; // Здесь будем хранить MAC-адрес геймпада
+static int  g_LastDevCount = -1; // Для умного логирования
 
 // ─── Log ──────────────────────────────────────────────────────────
 void logOpen() {
@@ -105,7 +107,7 @@ void uiFrame(){
     cPr(0,6,"  DPAD:",CC_DGRY);cPr(24,6,"L-STICK:",CC_DGRY);cPr(46,6,"R-STICK:",CC_DGRY);
     cPr(0,7,SEP,CC_DGRY);
     cPr(0,8,"  FACE:",CC_DGRY);cPr(42,8,"THUMBS:",CC_DGRY);
-    cPr(0,9,SEP,CC_DGRY);cPr(0,10,"  RAW DATA:",CC_DGRY); // Изменили RAW USB на RAW DATA
+    cPr(0,9,SEP,CC_DGRY);cPr(0,10,"  RAW DATA:",CC_DGRY);
     cPr(0,14,SEP,CC_DGRY);cPr(0,15,"  SNIFFER",CC_DGRY);
     cPr(0,21,SEP,CC_DGRY);
     cPr(1,22,"[S]",CC_YEL);cPr(4,22," sniffer on/off",CC_DGRY);
@@ -204,7 +206,7 @@ struct HG{
 //  Bluetooth Force Connect
 // ─────────────────────────────────────────────────────────────────
 void ForceConnectBluetoothHID() {
-    logLine("--- Bluetooth Check ---");
+    logLine("--- Bluetooth Check & Kick ---");
     
     BLUETOOTH_DEVICE_SEARCH_PARAMS search = {};
     search.dwSize = sizeof(search);
@@ -223,38 +225,43 @@ void ForceConnectBluetoothHID() {
 
     bool found = false;
     do {
-        // szName — это WCHAR, используем wcsstr для поиска
+        // Ищем по имени. info.szName имеет тип WCHAR (широкие символы)
         if (wcsstr(info.szName, L"MG-X") || wcsstr(info.szName, L"Nacon") || wcsstr(info.szName, L"NACON")) {
             found = true;
-            logLine("Found BT Device: %S[%02X:%02X:%02X:%02X:%02X:%02X]", 
-                info.szName, 
+            
+            // Сохраняем физический MAC адрес контроллера (в формате c03900450b33)
+            sprintf_s(g_MgxMac, sizeof(g_MgxMac), "%02x%02x%02x%02x%02x%02x", 
                 info.Address.rgBytes[5], info.Address.rgBytes[4], info.Address.rgBytes[3], 
                 info.Address.rgBytes[2], info.Address.rgBytes[1], info.Address.rgBytes[0]);
+
+            logLine("Found BT Device: %S[MAC: %s]", info.szName, g_MgxMac);
+            logLine("Status: %s", info.fConnected ? "CONNECTED" : "DISCONNECTED");
 
             // Стандартный GUID для HID over Bluetooth
             GUID hidService = { 0x00001124, 0x0000, 0x1000, {0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb} };
 
             // Принудительно отключаем службу (если "зависла")
             logLine("Disabling HID service to reset state...");
-            DWORD res = BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_DISABLE);
+            BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_DISABLE);
             Sleep(500);
 
-            // Включаем её обратно
+            // Включаем её обратно, инициируя новое соединение
             logLine("Enabling HID service...");
-            res = BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_ENABLE);
+            DWORD res = BluetoothSetServiceState(NULL, &info, &hidService, BLUETOOTH_SERVICE_ENABLE);
+            
             if (res == ERROR_SUCCESS) {
-                logLine("HID service enabled successfully for %S", info.szName);
-                uiMsg("Bluetooth HID service activated!", CC_GRN);
+                logLine("HID service kicked successfully for %S", info.szName);
+                uiMsg("Bluetooth HID service kicked!", CC_YEL);
             } else {
                 logErr("BluetoothSetServiceState enable failed: %lu", res);
             }
-            break; // Нашли первое подходящее устройство, прерываем поиск
+            break; // Нашли устройство, выходим из цикла поиска BT
         }
     } while (BluetoothFindNextDevice(hFind, &info));
     BluetoothFindDeviceClose(hFind);
 
     if (!found) {
-        logLine("No matching Bluetooth device found.");
+        logLine("No matching Bluetooth device found in Windows history.");
         uiMsg("Bluetooth device not found. Ensure it's paired.", CC_RED);
     }
 }
@@ -267,13 +274,24 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
     HDEVINFO hdi = SetupDiGetClassDevs(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (hdi == INVALID_HANDLE_VALUE) return false;
 
-    SP_DEVICE_INTERFACE_DATA did = {}; did.cbSize = sizeof(did);
+    SP_DEVICE_INTERFACE_DATA did = {}; 
+    did.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+    
+    // Считаем общее количество HID устройств
+    int devCount = 0;
+    while (SetupDiEnumDeviceInterfaces(hdi, NULL, &hidGuid, devCount, &did)) devCount++;
+    
+    // Будем логировать подробно ТОЛЬКО если кол-во устройств изменилось, чтобы не засорять лог
+    bool logDetails = (devCount != g_LastDevCount);
+    g_LastDevCount = devCount;
+
+    if (logDetails) logLine("=== HID DEVICE SCAN (%d devices present) ===", devCount);
+
     char  p1[512]={}, p3[512]={};
     DWORD s1=0, s3=0;
     bool  f1=false, f3=false;
     bool  gp1=false, gp3=false;
 
-    logLine("=== HID DEVICE SCAN ===");
     for (int i = 0; SetupDiEnumDeviceInterfaces(hdi, NULL, &hidGuid, i, &did); i++) {
         DWORD req = 0;
         SetupDiGetDeviceInterfaceDetail(hdi, &did, NULL, 0, &req, NULL);
@@ -284,8 +302,25 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
         if (!SetupDiGetDeviceInterfaceDetail(hdi, &did, det, req, NULL, NULL)) continue;
 
+        // Переводим путь в нижний регистр для безопасного поиска MAC-адреса
+        char lowerPath[512] = {};
+        if (det->DevicePath[0] != '\0') {
+            strncpy_s(lowerPath, sizeof(lowerPath), det->DevicePath, _TRUNCATE);
+            _strlwr_s(lowerPath);
+        }
+
+        // Ключевой хак: ищем физический MAC адрес в PnP пути устройства!
+        bool isN_byMac = (g_MgxMac[0] != '\0' && strstr(lowerPath, g_MgxMac) != nullptr);
+
         HANDLE ht = CreateFileA(det->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (ht == INVALID_HANDLE_VALUE) continue;
+        if (ht == INVALID_HANDLE_VALUE) {
+            ht = CreateFileA(det->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, NULL);
+        }
+
+        if (ht == INVALID_HANDLE_VALUE) {
+            if (isN_byMac && logDetails) logLine("  [%d] FOUND BY MAC, but FAILED to open handle! Err: %lu", i, GetLastError());
+            continue;
+        }
 
         HIDD_ATTRIBUTES attr = { sizeof(attr) };
         if (!HidD_GetAttributes(ht, &attr)) { CloseHandle(ht); continue; }
@@ -305,35 +340,38 @@ bool FindHIDPath(char* outPath, size_t pathMax, DWORD* outSize, bool* isGamepad)
             HidD_FreePreparsedData(ppd);
         }
 
-        // 1. Проверяем по USB VID/PID (если вдруг)
+        // 1. Проверяем по USB VID/PID 
         bool isN = (attr.VendorID == NACON_VID && attr.ProductID == NACON_PID);
 
-        // 2. Расширенный поиск по имени (для Bluetooth устройств)
-        char lowerName[256];
-        strncpy_s(lowerName, sizeof(lowerName), name, _TRUNCATE);
-        _strlwr_s(lowerName);
+        // 2. Расширенный поиск по имени 
+        char lowerName[256] = {};
+        if (name[0] != '\0') {
+            strncpy_s(lowerName, sizeof(lowerName), name, _TRUNCATE);
+            _strlwr_s(lowerName);
+        }
+        if (!isN && (strstr(lowerName, "mg-x") != nullptr || strstr(lowerName, "nacon") != nullptr)) isN = true;
 
-        if (!isN && (strstr(lowerName, "mg-x") != nullptr || strstr(lowerName, "nacon") != nullptr)) {
-            isN = true;
-            logLine("  ^-- Identified as Nacon by Name (Bluetooth Fallback)");
+        // 3. Подтверждение по MAC-адресу (Железобетонный метод для Bluetooth)
+        if (!isN && isN_byMac) isN = true;
+
+        if (logDetails) {
+            logLine("  [%d] VID=%04X PID=%04X Page=%02X Use=%02X Name=\"%s\"", 
+                    i, attr.VendorID, attr.ProductID, up, use, name);
+            if (isN_byMac) logLine("      ^-- Identifed by BT MAC address!");
+            else if (isN) logLine("      ^-- Identifed by VID/PID/Name");
         }
 
         bool isGP = (up == 0x01 && (use == 0x04 || use == 0x05));
-
-        if (isN) {
-            logLine("  Found NACON: Name=\"%s\" VID=%04X PID=%04X Page=%02X Use=%02X InLen=%u", 
-                    name, attr.VendorID, attr.ProductID, up, use, inLen);
-        }
 
         if (isN && isGP && !f1) { p1[0]='\0'; strncpy_s(p1, sizeof(p1), det->DevicePath, sizeof(p1)-1); s1=inLen; f1=true; gp1=true; }
         if (isN && !isGP && !f3) { p3[0]='\0'; strncpy_s(p3, sizeof(p3), det->DevicePath, sizeof(p3)-1); s3=inLen; f3=true; gp3=false; }
         
         CloseHandle(ht);
     }
+    
+    if (logDetails) logLine("=== SCAN END ===");
     SetupDiDestroyDeviceInfoList(hdi);
-    logLine("=== SCAN END ===");
 
-    // Правильный приоритет (сначала Nacon Gamepad, затем Nacon Raw)
     if (f1) { strncpy_s(outPath, pathMax, p1, pathMax-1); if(outSize)*outSize=s1; if(isGamepad)*isGamepad=gp1; return true; }
     if (f3) { strncpy_s(outPath, pathMax, p3, pathMax-1); if(outSize)*outSize=s3; if(isGamepad)*isGamepad=gp3; return true; }
     return false;
@@ -411,6 +449,7 @@ DWORD WINAPI ReadThread(LPVOID param) {
                     continue;
                 }
                 if (!imm && e0 != ERROR_IO_PENDING) {
+                    logErr("ReadFile fatal error: %lu", e0);
                     if (e0 == ERROR_DEVICE_NOT_CONNECTED || e0 == ERROR_INVALID_HANDLE) break;
                     Sleep(50); continue;
                 }
@@ -431,17 +470,23 @@ DWORD WINAPI ReadThread(LPVOID param) {
             DWORD mbr = 0;
             if (!GetOverlappedResult(hf, &mov, &mbr, FALSE)) {
                 DWORD merr = GetLastError();
-                if (merr == ERROR_INVALID_HANDLE || merr == ERROR_DEVICE_NOT_CONNECTED || merr == ERROR_OPERATION_ABORTED) break;
+                if (merr == ERROR_INVALID_HANDLE || merr == ERROR_DEVICE_NOT_CONNECTED || merr == ERROR_OPERATION_ABORTED) {
+                    logErr("GetOverlappedResult disconnected! Err: %lu", merr);
+                    break;
+                }
                 pendingRead = false; Sleep(50); continue;
             }
             
             pendingRead = false;
-            if (mbr == 0) continue;
-            if (first) { LogFirstPkt("ReadFile", mb.data(), mbr); first = false; }
-            PushPacket(mb.data(), mbr, ctx->hNewPkt);
+            if (mbr > 0) {
+                if (first) { LogFirstPkt("ReadFile", mb.data(), mbr); first = false; }
+                PushPacket(mb.data(), mbr, ctx->hNewPkt);
+            }
         }
         CloseHandle(hem);
         CloseHandle(hf);
+    } else {
+        logErr("Failed to open device handle for reading! Err: %lu", GetLastError());
     }
 
     logLine("ReadThread [HID] exited loop");
@@ -459,7 +504,7 @@ XUSB_REPORT MapNaconToXbox(const std::vector<BYTE>& buf) {
         int v=inv?(128-(int)b):((int)b-128);v*=256;
         if(v>32767)v=32767;if(v<-32768)v=-32768;return (SHORT)v;};
 
-    // Заполни маппинг по необходимости
+    // Заполни маппинг по необходимости после получения пакетов
     (void)toAxis;
     return r;
 }
@@ -496,6 +541,9 @@ int main() {
     bool snifOn=false;
     DWORD pkts=0;
 
+    int notFoundCount = 0;
+    bool firstRun = true;
+
     // Цикл переподключения
     while (globalRunning) {
         WorkMode mode = MODE_UNKNOWN;
@@ -504,34 +552,46 @@ int main() {
 
         uiClearMsg();
         
-        // 1. Форсированно будим устройство через Bluetooth-службу
-        ForceConnectBluetoothHID();
-        Sleep(1500); // Даём Windows время поднять HID-драйверы для устройства
-        
-        // 2. Ищем HID интерфейсы
-        uiMsg("Scanning for Nacon MG-X (HID)...", CC_YEL);
-        logLine("--- Starting Discovery ---");
-
-        char hidPath[512] = {};
-        if (FindHIDPath(hidPath, sizeof(hidPath), &rSz, &isGamepad)) {
-            strncpy_s(rtCtx.devPath, sizeof(rtCtx.devPath), hidPath, sizeof(hidPath)-1);
-            mode = MODE_HID;
-            rtCtx.mode = MODE_HID;
-            logLine("HID mode detected");
-
-            if (!isGamepad) {
-                uiMsg("Warning: Device does not report standard gamepad usage.", CC_YEL);
-            } else {
-                uiMsg("Bluetooth HID Connected Successfully", CC_GRN);
+        // Главный цикл поиска
+        while (globalRunning && mode == MODE_UNKNOWN) {
+            
+            // Если ищем дольше 10 секунд - пытаемся физически пересоздать подключение Bluetooth
+            if (firstRun || notFoundCount >= 10) { 
+                ForceConnectBluetoothHID();
+                notFoundCount = 0;
+                firstRun = false;
+                Sleep(2500); // Даём Windows время поднять драйверы
             }
+
+            uiMsg("Scanning for Nacon MG-X (HID)...", CC_YEL);
+            
+            char hidPath[512] = {};
+            if (FindHIDPath(hidPath, sizeof(hidPath), &rSz, &isGamepad)) {
+                
+                // Защита от кривых дескрипторов (0 байт)
+                if (rSz < 8) rSz = 64;
+                if (rSz > PKT_MAX) rSz = PKT_MAX;
+
+                strncpy_s(rtCtx.devPath, sizeof(rtCtx.devPath), hidPath, sizeof(hidPath)-1);
+                mode = MODE_HID;
+                rtCtx.mode = MODE_HID;
+                logLine("HID mode detected");
+
+                if (!isGamepad) {
+                    uiMsg("Warning: Device does not report standard gamepad usage.", CC_YEL);
+                } else {
+                    uiMsg("Bluetooth HID Connected Successfully", CC_GRN);
+                }
+                break;
+            }
+
+            if (keyDown(VK_ESCAPE)) { globalRunning = false; break; }
+
+            notFoundCount++;
+            Sleep(1000); // Сканируем ровно 1 раз в секунду
         }
 
-        // Если не нашли — ждем и пробуем снова
-        if (mode == MODE_UNKNOWN) {
-            if (keyDown(VK_ESCAPE)) break;
-            Sleep(1500);
-            continue;
-        }
+        if (!globalRunning) break;
 
         rtCtx.pktSize = rSz;
         rtCtx.stop = false;
@@ -539,7 +599,7 @@ int main() {
 
         uiStatus(true, true, true, mode, pkts);
 
-        // Старт потока
+        // Старт потока чтения
         HANDLE hThread = CreateThread(NULL, 0, ReadThread, &rtCtx, 0, NULL);
         if (!hThread) {
             uiMsg("FATAL: CreateThread",CC_RED); Sleep(3000); break;
@@ -581,7 +641,11 @@ int main() {
 
         // Очистка перед переподключением
         rtCtx.stop = true;
-        WaitForSingleObject(hThread, 3000);
+        
+        if (WaitForSingleObject(hThread, 3000) == WAIT_TIMEOUT) {
+            logErr("Thread stuck! Terminating forcibly.");
+            TerminateThread(hThread, 0);
+        }
         CloseHandle(hThread);
 
         uiStatus(true, false, false, MODE_UNKNOWN, pkts);
@@ -589,6 +653,9 @@ int main() {
             uiClearMsg();
             uiMsg("Device lost or thread exited. Reconnecting...", CC_RED);
             logLine("Connection dropped. Restarting discovery...");
+            
+            // Если устройство отвалилось, форсируем пинок на следующем тике
+            notFoundCount = 10; 
             Sleep(1000);
         }
     }
