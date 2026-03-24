@@ -1,0 +1,42 @@
+cmake_minimum_required(VERSION 3.16)
+project(NaconBridge CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Путь к ViGEm Client SDK
+# GitHub Actions: SDK устанавливается в шаге workflow
+# Локально: укажи путь к ViGEm\include и ViGEm\lib
+set(VIGEM_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/deps/ViGEmClient/include"
+    CACHE PATH "ViGEm Client include dir")
+set(VIGEM_LIB_DIR "${CMAKE_SOURCE_DIR}/deps/ViGEmClient/lib/Release/x64"
+    CACHE PATH "ViGEm Client lib dir")
+
+add_executable(nacon_bridge nacon_bridge.cpp)
+
+target_include_directories(nacon_bridge PRIVATE
+    ${VIGEM_INCLUDE_DIR}
+)
+
+# Все необходимые библиотеки явно
+target_link_libraries(nacon_bridge PRIVATE
+    Ws2_32.lib
+    Bthprops.lib
+    hid.lib
+    setupapi.lib
+    "${VIGEM_LIB_DIR}/ViGEmClient.lib"
+)
+
+# Флаги компилятора
+target_compile_definitions(nacon_bridge PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _CRT_SECURE_NO_WARNINGS
+    UNICODE
+    _UNICODE
+)
+
+# x64 Release
+set_target_properties(nacon_bridge PROPERTIES
+    WIN32_EXECUTABLE FALSE
+)
